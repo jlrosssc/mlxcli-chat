@@ -1,0 +1,3735 @@
+#!/usr/bin/env python3
+"""Lightweight Tkinter chat GUI for oMLX with Markdown file import."""
+import difflib
+import json
+import os
+import pathlib
+import queue
+import re
+import shlex
+import shutil
+import subprocess
+import threading
+import time
+import tkinter as tk
+import tkinter.font as tkfont
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+import hashlib
+import html
+from html.parser import HTMLParser
+from datetime import datetime
+from xml.sax.saxutils import escape
+from tkinter import filedialog, messagebox, simpledialog, ttk
+try:
+    from docx_export import markdown_to_docx as formatted_markdown_to_docx
+except ImportError:
+    formatted_markdown_to_docx = None
+try:
+    import psutil
+except ImportError:
+    psutil = None
+from mlxlib import (
+    compute_repo_update_status, compute_model_update_status,
+    load_default_dir, MAX_FILE_CHARS, MAX_HISTORY_TURNS, MAX_RESPONSE_TOKENS,
+    MAX_CONTEXT_CHARS, MAX_TOOL_STEPS, SERVER_MAX_CONTEXT_TOKENS,
+    CONVERTIBLE, REVIEWABLE_TEXT, TOOLS, all_tool_schemas, plugin_tools,
+    is_code_request, should_auto_enable_agentic as gui_should_auto_enable_agentic,
+    requires_agentic_execution as gui_requires_agentic_execution,
+    execution_contract as gui_execution_contract, tool_result_failed as gui_tool_failed,
+    resolve_output_path, normalize_tool_name as gui_normalize_tool_name,
+    infer_command_cwd as gui_infer_command_cwd, term_present as gui_term_present,
+    python_syntax_error, missing_local_imports,
+    backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
+    detect_repetition_loop as gui_detect_repetition_loop,
+    parse_bare_json_tool_call as gui_parse_bare_json_tool_call,
+    parse_xml_tag_tool_call as gui_parse_xml_tag_tool_call,
+    parse_python_call_tool_call as gui_parse_python_call_tool_call,
+    parse_attr_tag_tool_call as gui_parse_attr_tag_tool_call,
+    DEFAULT_REPETITION_PENALTY, _unique_call_id as gui_unique_call_id,
+    suggest_better_backend as gui_suggest_better_backend,
+    load_model_settings, save_model_settings, MODEL_SETTING_DEFAULTS,
+    MODEL_SETTING_BOUNDS, clamp_model_setting,
+    record_last_artifact, last_artifact_system_note,
+    caffeinate_guard, server_busy_guard, log_error, tail_error_log, ERROR_LOG_PATH,
+    rag_remote_config, rag_remote_search, web_search,
+    load_host_aliases, keychain_get, request as ha_http_request, api as ha_http_api,
+)
+
+
+SETTINGS = pathlib.Path.home() / ".omlx" / "settings.json"
+SYSTEM_PROMPT_PATH = pathlib.Path.home() / ".omlx" / "mlx_system_prompt.txt"
+GUI_DEFAULTS_PATH = pathlib.Path.home() / ".omlx" / "mlxgui_defaults.json"
+SESSIONS_DIR = pathlib.Path.home() / ".omlx" / "sessions"
+OMLX_BIN = pathlib.Path.home() / ".omlx" / "bin" / "omlx"
+BACKEND_PATH = pathlib.Path.home() / ".omlx" / "mlx_backend.txt"
+MODELS_ROOT = pathlib.Path.home() / "Models"
+TURBO_QWEN_ROOT = MODELS_ROOT / "turbo-fieldfare-nvmai"
+TURBO_QWEN_SERVER_BIN = TURBO_QWEN_ROOT / ".build" / "release" / "TinyTitanServer"
+TURBO_QWEN_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "qwen36.gturbo"
+TURBO_QWEN_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-qwen-server.log"
+# Ornith 1.5 shares the same repo/binary as Qwen -- same install, just a
+# different repacked model file and port, so it can run side by side. The
+# repo/binary was NVMAI/NVMAIServer before the 2026-09 upstream rename to
+# TinyTitan/TinyTitanServer -- the directory on disk is still literally
+# named turbo-fieldfare-nvmai (renaming it is a separate, more disruptive
+# change since other scripts/paths reference it by that name).
+TURBO_ORNITH_MODEL_DIR = TURBO_QWEN_ROOT / "scratch" / "ornith15.gturbo"
+TURBO_ORNITH_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-ornith-server.log"
+# KAT-Coder-V2.5-Dev installs under models/ (the installer's own "install to
+# models/<id>" path) rather than scratch/ like Qwen/Ornith's manually
+# repacked .gturbo files -- a different install convention, same
+# TinyTitanServer binary and MoE/expert-cache architecture.
+TURBO_KATCODER_MODEL_DIR = TURBO_QWEN_ROOT / "models" / "kat-coder-v2.5_35B_A3B_4Bit"
+TURBO_KATCODER_SERVER_LOG = pathlib.Path.home() / ".omlx" / "turbofieldfare-katcoder-server.log"
+TURBO_STATUS_APP = pathlib.Path.home() / "Applications" / "Turbo Status.app"
+MLXGUI_ICON_PATH = pathlib.Path(__file__).resolve().parent / "mlxgui_icon.png"
+RESOURCE_REFRESH_MS = 5000
+STATS_REFRESH_MS = 1500
+RAG_MAX_FILES = 64
+RAG_MAX_CHUNKS = 4
+RAG_CHUNK_CHARS = 1800
+RAG_COMPARE_FILE_LIMIT = 12
+RAG_COMPARE_CHARS = 700
+RAG_CACHE_DIRNAME = ".mlxgui_rag_cache"
+RAG_CACHE_INDEX = "index.json"
+URL_MAX_FETCHES = 2
+URL_MAX_CHARS = 12000
+CONVERT_MODES = ("auto", "all", "off")
+SUPPORTED_BACKENDS = ("omlx", "turbofieldfare-qwen", "turbofieldfare-ornith", "turbofieldfare-katcoder")
+DEFAULT_SYSTEM = (
+    "You are a concise assistant running locally on the user's Mac.\n"
+    "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+    "Treat the user's supplied text, numbers, filenames, and codes as authoritative literal data. "
+    "Do not silently correct, normalize, truncate, expand, or substitute them unless explicitly asked.\n"
+    "When a request refers to content 'below', 'above', or 'in the pasted list', verify that the content is actually present. "
+    "If required input is missing, say exactly what is missing instead of guessing.\n"
+    "When a request names a category or target (e.g. 'my photos', 'my documents', 'my files') without stating where it lives, "
+    "ask which folder or path to use. Do not silently reuse a location mentioned in an earlier, unrelated request.\n"
+    "For file and spreadsheet tasks, use the named local resource when available, preserve text-formatted numeric values, "
+    "and follow requested columns, order, and output shape exactly. Distinguish source data from user-provided input data.\n"
+    "For exact-match tasks, compare the complete requested key and apply only the explicitly stated normalization rules; "
+    "never match a convenient suffix or a similar-looking value.\n"
+    "For local file listings or size rankings, use a filename-safe approach such as find with stat and sort by bytes; "
+    "do not parse ls output with positional awk fields because filenames may contain spaces.\n"
+    "For file metadata such as creation dates, use stat on the exact files and report the filesystem values; "
+    "do not infer dates from filenames or conversation text.\n"
+    "For code requests, give a short practical note and the final code block only unless the user asks for explanation.\n"
+    f"Save created files in {load_default_dir()} unless the user gives another path.\n"
+    "For local file tasks, use the available tools and never claim a file was created, run, inspected, verified, or shared without tool evidence.\n"
+    "web_search reaches the open internet, unlike every other tool here, and always requires the user to approve it live, every call. "
+    "Only use it when the request actually needs current, external, or general-internet information that no local tool or your own knowledge can answer -- never call it by default, proactively, or to double-check a routine question.\n"
+    "Ground-truth check: for any task involving calculation, physical/scientific data, or a numeric result that "
+    "has a real correct answer, derive expected reference values from known facts first, then check your output "
+    "against them with a tool before declaring the task complete. Running cleanly and being correct are different "
+    "claims; only the second is done.\n"
+    "When running a local script against an absolute input file, use that input file's directory as the working directory unless another one is explicitly requested. Resolve relative outputs beside the input file.\n"
+    "For multi-file creation, use write_file once per file; do not use python_interpreter to embed filesystem writes.\n"
+    "Keep replies brief and avoid repeating large imported text unless asked.\n"
+    "Respect local LLM memory limits: summarize when possible, use only relevant imported context, and suggest Clear when old context is no longer needed.\n"
+    "Be direct, respectful, and practical."
+)
+PRESET_SYSTEMS = {
+    "Built-in Default": DEFAULT_SYSTEM,
+    "Concise, Efficient Agent Conversation": (
+        "You are a concise, efficient assistant running locally on the user's Mac.\n"
+        "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+        "Answer with the smallest complete response that solves the request.\n"
+        "For code requests, give the final code block first with at most one short note.\n"
+        "Avoid restating the user's request or repeating large imported text.\n"
+        "Use bullets only when they improve scanning.\n"
+        "Ask a clarifying question only when the missing detail blocks useful work.\n"
+        "Respect local LLM memory limits: use only relevant imported context, summarize instead of quoting, and suggest Clear when old context is no longer needed.\n"
+        f"Save created files in {load_default_dir()} unless the user gives another path.\n"
+        "Be direct, respectful, and practical."
+    ),
+    "Code-Focused": (
+        "You are a concise coding assistant running locally on the user's Mac.\n"
+        "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+        "For code requests, provide runnable code and only the explanation needed to use it.\n"
+        "Prefer simple, efficient standard-library solutions unless a dependency is clearly better.\n"
+        "Mention important assumptions and edge cases briefly.\n"
+        "Respect local LLM memory limits and avoid repeating large context.\n"
+        f"Save created files in {load_default_dir()} unless the user gives another path."
+    ),
+    "Document Drafting": (
+        "You are a concise writing assistant running locally on the user's Mac.\n"
+        "Do not reveal hidden reasoning, internal planning, or chain-of-thought.\n"
+        "Produce clean Markdown suitable for DOCX export.\n"
+        "Use clear headings, short paragraphs, and practical formatting.\n"
+        "Avoid long quoted source text unless the user asks for it.\n"
+        "Respect local LLM memory limits by summarizing imported material.\n"
+        f"Save created files in {load_default_dir()} unless the user gives another path."
+    ),
+}
+CODE_REQUEST_SYSTEM = (
+    "This turn is a code/script request. Do not include hidden reasoning, planning, or analysis. "
+    "Start with the final code block, shown directly in this response — this applies even if you also "
+    "write the code to a file and/or run it as part of an agentic tool sequence; showing the code in the "
+    "response and using tools to save/execute it are both required, not alternatives to each other. "
+    "After the code, include only requested output or one short usage note. "
+    "If the user asks to list generated values, list them after the code without explaining your process."
+)
+RAG_USE_SYSTEM = (
+    "Local reference excerpts from the selected chat RAG folder are included for this turn. "
+    "Use those excerpts as your available file context. Do not say you cannot access files or folders directly "
+    "if RAG excerpts are present. Do not ask the user to paste or re-share documents that are already represented "
+    "in the provided RAG excerpts."
+)
+URL_USE_SYSTEM = (
+    "Fetched web page content is included for this turn. Use only the retrieved page content for URL summary "
+    "or title requests. If URL retrieval fails, say so explicitly and do not guess."
+)
+
+
+def load_cfg():
+    url = os.environ.get("OMLX_URL", "http://localhost:8000")
+    key = os.environ.get("OMLX_API_KEY", "")
+    if not key and SETTINGS.exists():
+        try:
+            settings = json.loads(SETTINGS.read_text())
+            key = settings.get("auth", {}).get("api_key", "")
+            port = settings.get("server", {}).get("port", 8000)
+            if "OMLX_URL" not in os.environ:
+                url = f"http://localhost:{port}"
+        except Exception:
+            pass
+    return url, key
+
+
+def load_backend():
+    selected = os.environ.get("MLXCLI_BACKEND", "").strip().lower()
+    if selected in SUPPORTED_BACKENDS:
+        return selected
+    try:
+        selected = BACKEND_PATH.read_text().strip().lower()
+        if selected in SUPPORTED_BACKENDS:
+            return selected
+    except Exception:
+        pass
+    return "omlx"
+
+
+def save_backend(backend):
+    BACKEND_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BACKEND_PATH.write_text(backend + "\n")
+
+
+def is_turbo_backend(backend):
+    return backend in ("turbofieldfare-qwen", "turbofieldfare-ornith", "turbofieldfare-katcoder")
+
+
+def backend_label(backend):
+    return {
+        "omlx": "oMLX",
+        "turbofieldfare-qwen": "TurboFieldfare Qwen (Qwen 3.6)",
+        "turbofieldfare-ornith": "TurboFieldfare Ornith (Ornith 1.5)",
+        "turbofieldfare-katcoder": "TurboFieldfare KAT-Coder (KAT-Coder-V2.5-Dev)",
+    }.get(backend, backend)
+
+
+def backend_description(backend):
+    return {
+        "omlx": "General / Flexible",
+        "turbofieldfare-qwen": "Qwen 3.6 / Coding",
+        "turbofieldfare-ornith": "Ornith 1.5 / Coding",
+        "turbofieldfare-katcoder": "KAT-Coder V2.5 / Coding",
+    }.get(backend, "")
+
+
+def backend_paths(backend):
+    if backend == "turbofieldfare-qwen":
+        return {
+            "root": TURBO_QWEN_ROOT,
+            "server_bin": TURBO_QWEN_SERVER_BIN,
+            "model_dir": TURBO_QWEN_MODEL_DIR,
+            "log": TURBO_QWEN_SERVER_LOG,
+            "url": "http://127.0.0.1:8081",
+        }
+    if backend == "turbofieldfare-ornith":
+        return {
+            "root": TURBO_QWEN_ROOT,
+            "server_bin": TURBO_QWEN_SERVER_BIN,
+            "model_dir": TURBO_ORNITH_MODEL_DIR,
+            "log": TURBO_ORNITH_SERVER_LOG,
+            "url": "http://127.0.0.1:8083",
+        }
+    if backend == "turbofieldfare-katcoder":
+        return {
+            "root": TURBO_QWEN_ROOT,
+            "server_bin": TURBO_QWEN_SERVER_BIN,
+            "model_dir": TURBO_KATCODER_MODEL_DIR,
+            "log": TURBO_KATCODER_SERVER_LOG,
+            "url": "http://127.0.0.1:8082",
+        }
+    return {}
+
+
+
+def load_backend_cfg(backend):
+    if backend == "omlx":
+        url, key = load_cfg()
+        return url, key
+    paths = backend_paths(backend)
+    env_var = {
+        "turbofieldfare-qwen": "TURBOFIELDFARE_QWEN_URL",
+        "turbofieldfare-ornith": "TURBOFIELDFARE_ORNITH_URL",
+        "turbofieldfare-katcoder": "TURBOFIELDFARE_KATCODER_URL",
+    }.get(backend, "TURBOFIELDFARE_URL")
+    return os.environ.get(env_var, paths["url"]), os.environ.get("TURBOFIELDFARE_API_KEY", "")
+
+
+def load_system_prompt():
+    try:
+        saved = SYSTEM_PROMPT_PATH.read_text().strip()
+        if saved:
+            return saved
+    except Exception:
+        pass
+    return DEFAULT_SYSTEM
+
+
+def save_system_prompt(text):
+    SYSTEM_PROMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SYSTEM_PROMPT_PATH.write_text(text.strip() + "\n")
+
+
+def load_gui_defaults():
+    defaults = {"convert_mode": "auto"}
+    try:
+        saved = json.loads(GUI_DEFAULTS_PATH.read_text())
+        if saved.get("convert_mode") in CONVERT_MODES:
+            defaults["convert_mode"] = saved["convert_mode"]
+    except Exception:
+        pass
+    return defaults
+
+
+def save_gui_defaults(defaults):
+    GUI_DEFAULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GUI_DEFAULTS_PATH.write_text(json.dumps(defaults, indent=2) + "\n")
+
+
+def request(url, key, path, payload=None):
+    return urllib.request.Request(
+        url.rstrip("/") + path,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {key}"},
+    )
+
+
+def api(url, key, path, payload=None):
+    with urllib.request.urlopen(request(url, key, path, payload), timeout=900) as resp:
+        return json.load(resp)
+
+
+def server_up(url, key):
+    try:
+        api(url, key, "/v1/models")
+        return True
+    except Exception:
+        return False
+
+
+def stop_omlx():
+    if not OMLX_BIN.exists():
+        return False
+    try:
+        result = subprocess.run([str(OMLX_BIN), "stop"], capture_output=True, text=True, timeout=30)
+    except Exception:
+        return False
+    output = (result.stdout or "") + (result.stderr or "")
+    return result.returncode == 0 and ("stop" in output.lower() or not output.strip())
+
+
+def stop_turbo(backend):
+    paths = backend_paths(backend)
+    if not paths:
+        return False
+    pattern = str(paths["model_dir"])
+    try:
+        first = subprocess.run(["pkill", "-f", pattern], capture_output=True, text=True, timeout=15)
+        time.sleep(1)
+        probe = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=15)
+        if probe.returncode == 0:
+            second = subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True, text=True, timeout=15)
+            return second.returncode == 0
+        return first.returncode == 0
+    except Exception:
+        return False
+
+
+TURBO_BACKENDS = ("turbofieldfare-qwen", "turbofieldfare-ornith", "turbofieldfare-katcoder")
+
+
+def stop_other_backend(target_backend, status):
+    # All ~35B-class turbo backends run on different ports and could
+    # technically coexist, but only one stays loaded at a time to avoid
+    # doubling resident RAM for no benefit -- switching to any backend stops
+    # every other one (not just a single hardcoded "other", now that there
+    # are three turbo backends), same as it stops oMLX.
+    if target_backend == "omlx":
+        stopped_any = any([stop_turbo(other) for other in TURBO_BACKENDS])
+        status("Stopped TurboFieldfare" if stopped_any else "TurboFieldfare was not running")
+    else:
+        stopped_omlx = stop_omlx()
+        status("Stopped oMLX" if stopped_omlx else "oMLX was not running")
+        for other in TURBO_BACKENDS:
+            if other != target_backend:
+                stop_turbo(other)
+
+
+def ensure_turbo_status_app():
+    try:
+        if TURBO_STATUS_APP.exists():
+            subprocess.run(["open", "-g", str(TURBO_STATUS_APP)], capture_output=True, text=True)
+    except Exception:
+        pass
+
+
+def ensure_server(backend, url, key, status):
+    if is_turbo_backend(backend):
+        ensure_turbo_status_app()
+    if server_up(url, key):
+        return True
+    if is_turbo_backend(backend):
+        paths = backend_paths(backend)
+        if not paths["server_bin"].exists():
+            status(f"{backend_label(backend)} server is not built")
+            return False
+        if not paths["model_dir"].exists():
+            status(f"{backend_label(backend)} model is not installed")
+            return False
+        status(f"Starting {backend_label(backend)}...")
+        paths["log"].parent.mkdir(parents=True, exist_ok=True)
+        log_handle = open(paths["log"], "a")
+        log_handle.write(f"\n=== launch {datetime.now().isoformat()} ===\n")
+        log_handle.flush()
+        launch_args = [str(paths["server_bin"]), "--model", str(paths["model_dir"]), "--port", url.rsplit(":", 1)[-1],
+             "--max-context", str(SERVER_MAX_CONTEXT_TOKENS)]
+        if backend in TURBO_BACKENDS:
+            # Switched to the NVMAI fork (2026-08-23): ~3x measured decode speedup
+            # over the old TurboFieldfareServer build. --rdadvise doesn't exist in
+            # NVMAIServer's argument parser (unlike the old server) so it's dropped
+            # here; --expert-cache-slots is still supported and kept. Ornith shares
+            # the same MoE/expert-cache architecture as Qwen here.
+            launch_args += ["--expert-cache-slots", "32"]
+        subprocess.Popen(
+            launch_args,
+            cwd=paths["root"], stdout=log_handle, stderr=log_handle,
+        )
+    else:
+        status("Launching oMLX...")
+        subprocess.run(["open", "-a", "oMLX"], capture_output=True, text=True)
+        if OMLX_BIN.exists():
+            status("Starting oMLX server...")
+            subprocess.run([str(OMLX_BIN), "start", "--timeout", "60"], capture_output=True, text=True)
+    for _ in range(30):
+        time.sleep(2)
+        if server_up(url, key):
+            status(f"{backend_label(backend)} is up")
+            return True
+    status(f"{backend_label(backend)} server not reachable")
+    return False
+
+
+def list_models(url, key):
+    data = api(url, key, "/v1/models")
+    import mlxlib as _ml_pref
+    return _ml_pref.prefer_default_model([m["id"] for m in data.get("data", [])])
+
+
+def model_tags(model_id):
+    name = model_id.lower()
+    tags = []
+    if "coder" in name or "code" in name:
+        tags.append("Coding")
+    if "gpt-oss" in name or "reason" in name or "r1" in name:
+        tags.append("Reasoning")
+    if "vision" in name or "vl" in name or "llava" in name:
+        tags.append("Vision")
+    if "instruct" in name or "chat" in name or "qwen" in name or "llama" in name or "gemma" in name:
+        tags.append("General")
+    if "creative" in name or "story" in name or "write" in name:
+        tags.append("Creative")
+    if not tags:
+        tags.append("General")
+    # keep order stable, remove duplicates
+    return list(dict.fromkeys(tags))
+
+
+def model_label(model_id):
+    return f"{model_id} [{', '.join(model_tags(model_id))}]"
+
+
+def resolve_model_id(selected, mapping):
+    if selected in mapping:
+        return mapping[selected]
+    known_ids = list(mapping.values())
+    for model_id in known_ids:
+        if selected == model_id or selected.startswith(model_id + " ["):
+            return model_id
+    # Defensive fallback if the visible text was rewritten repeatedly.
+    cleaned = re.sub(r"\s+\[[^\]]+\]\s*$", "", selected).strip()
+    for model_id in known_ids:
+        if cleaned == model_id or cleaned.startswith(model_id + " ["):
+            return model_id
+    return cleaned or selected
+
+
+class HTMLTextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_title = False
+        self.skip_depth = 0
+        self.title_parts = []
+        self.text_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag == "title":
+            self.in_title = True
+        if tag in {"script", "style", "noscript"}:
+            self.skip_depth += 1
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "title":
+            self.in_title = False
+        if tag in {"script", "style", "noscript"} and self.skip_depth:
+            self.skip_depth -= 1
+        if tag in {"p", "div", "section", "article", "li", "br", "h1", "h2", "h3", "h4"}:
+            self.text_parts.append("\n")
+
+    def handle_data(self, data):
+        if self.skip_depth:
+            return
+        text = html.unescape(data or "")
+        if self.in_title:
+            self.title_parts.append(text)
+        self.text_parts.append(text)
+
+    def title(self):
+        return re.sub(r"\s+", " ", "".join(self.title_parts)).strip()
+
+    def text(self):
+        return re.sub(r"\s+", " ", "".join(self.text_parts)).strip()
+
+
+def detect_urls(text):
+    found = re.findall(r"https?://[^\s)>\"']+", text or "")
+    return list(dict.fromkeys(found))[:URL_MAX_FETCHES]
+
+
+def fetch_url_context_via_safari(url):
+    script = f'''
+set targetUrl to "{url.replace('"', '\\"')}"
+tell application "Safari"
+    activate
+    set newDoc to make new document with properties {{URL:targetUrl}}
+    repeat 60 times
+        delay 0.5
+        try
+            set readyState to do JavaScript "document.readyState" in current tab of newDoc
+            if readyState is "complete" then exit repeat
+        end try
+    end repeat
+    set pageTitle to do JavaScript "document.title || ''" in current tab of newDoc
+    set pageText to do JavaScript "document.body ? document.body.innerText : ''" in current tab of newDoc
+    close newDoc
+    return pageTitle & linefeed & pageText
+end tell
+'''
+    proc = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "Safari browser fallback failed").strip()
+        raise RuntimeError(detail)
+    output = proc.stdout or ""
+    title, _, text = output.partition("\n")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        raise RuntimeError("Safari browser fallback returned no readable text")
+    return {
+        "url": url,
+        "title": title.strip() or urllib.parse.urlparse(url).netloc,
+        "content_type": "text/html (Safari fallback)",
+        "text": text[:URL_MAX_CHARS],
+    }
+
+
+def fetch_url_context(url):
+    parsed = urllib.parse.urlparse(url)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/127.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "text/plain;q=0.8,*/*;q=0.7"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": f"{parsed.scheme}://{parsed.netloc}/" if parsed.scheme and parsed.netloc else url,
+    }
+    last_error = None
+    for candidate in [url, url.rstrip("/")]:
+        if not candidate:
+            continue
+        req = urllib.request.Request(candidate, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                raw = resp.read()
+                charset = resp.headers.get_content_charset() or "utf-8"
+            body = raw.decode(charset, errors="replace")
+            break
+        except Exception as exc:
+            last_error = exc
+    else:
+        status = getattr(last_error, "code", None)
+        if status in {403, 429}:
+            return fetch_url_context_via_safari(url)
+        raise last_error or RuntimeError("Unable to retrieve URL")
+    if "html" in content_type or "<html" in body.lower():
+        parser = HTMLTextExtractor()
+        parser.feed(body)
+        title = parser.title() or urllib.parse.urlparse(url).netloc
+        text = parser.text()
+    elif content_type.startswith("text/"):
+        title = urllib.parse.urlparse(url).path.rsplit("/", 1)[-1] or url
+        text = body
+    else:
+        raise RuntimeError(f"Unsupported content type for lightweight fetch: {content_type or 'unknown'}")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        raise RuntimeError("No readable text found on page")
+    return {
+        "url": url,
+        "title": title,
+        "content_type": content_type or "unknown",
+        "text": text[:URL_MAX_CHARS],
+    }
+
+
+def convert_file(path, mode):
+    p = pathlib.Path(path).expanduser()
+    should_convert = mode == "all" or (mode == "auto" and p.suffix.lower() in CONVERTIBLE)
+    if should_convert:
+        if p.suffix.lower() == ".doc":
+            conv = subprocess.run(
+                ["/usr/bin/textutil", "-convert", "txt", "-stdout", str(p)],
+                capture_output=True,
+                text=True,
+            )
+            if conv.returncode == 0 and conv.stdout.strip():
+                return conv.stdout, f"{p.name} (converted via textutil)"
+        markitdown = find_markitdown()
+        conv = subprocess.run([markitdown, str(p)], capture_output=True, text=True)
+        if conv.returncode != 0 or not conv.stdout.strip():
+            detail = (conv.stderr or conv.stdout or "no output").strip()
+            raise RuntimeError(f"markitdown could not convert {p.name}:\n{detail}")
+        return conv.stdout, f"{p.name} (converted to markdown)"
+    return p.read_text(errors="replace"), p.name
+
+
+def find_markitdown():
+    found = shutil.which("markitdown")
+    if found:
+        return found
+    for candidate in ("/usr/local/bin/markitdown", "/opt/homebrew/bin/markitdown"):
+        if pathlib.Path(candidate).exists():
+            return candidate
+    raise RuntimeError(
+        "markitdown is not available to the GUI. Install it with "
+        "pip install markitdown, or run mlxgui from a shell that has markitdown on PATH."
+    )
+
+
+def usage_counts(usage):
+    if not usage:
+        return 0, 0
+    in_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    out_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
+    return int(in_tokens or 0), int(out_tokens or 0)
+
+
+PROMPT_REFINER_SYSTEM = (
+    "You are a prompt decoder, not the task solver. Rewrite the user's request into one precise prompt for another LLM.\n"
+    "Return only the rewritten prompt, with no preamble, analysis, or commentary.\n"
+    "Preserve every literal filename, path, number, code, quoted value, list item, and requested output column.\n"
+    "Do not invent missing inputs or facts. If the request refers to missing content, explicitly state that the input is missing.\n"
+    "Use the supplied recent context only to resolve references such as 'these', 'each', 'above', or 'the previous result'; "
+    "do not treat context as a new task unless the current request refers to it.\n"
+    "Resolve intent into: objective, resources, exact operation, constraints, preservation/order rules, and output format.\n"
+    "For matching or lookup tasks, require full-key matching and repeat any normalization rule exactly; never weaken it to suffix or similarity matching.\n"
+    "For local file listings or size rankings, recommend find with stat and byte-based sorting; never rely on ls with positional awk fields because filenames may contain spaces.\n"
+    "For file metadata such as creation dates, require stat on the exact files and never infer dates from names or prior text.\n"
+    "Keep the result compact and directly actionable."
+)
+
+
+def compact_refinement_context(messages, max_chars=9000):
+    parts = []
+    for message in messages[1:]:
+        role = message.get("role")
+        content = (message.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        parts.append(f"{role.title()} message:\n{content[:4500]}")
+    return "\n\n".join(parts[-4:])[-max_chars:]
+
+
+def refine_prompt_once(url, key, model, raw_request, context=""):
+    prompt = raw_request
+    if context:
+        prompt = f"Recent conversation context (use only for resolving references):\n{context}\n\nCurrent request to refine:\n{raw_request}"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": PROMPT_REFINER_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 900,
+        "stream": False,
+        "repetition_penalty": DEFAULT_REPETITION_PENALTY,
+    }
+    data = api(url, key, "/v1/chat/completions", payload)
+    choices = data.get("choices") or []
+    content = (choices[0].get("message") or {}).get("content", "") if choices else ""
+    return content.strip(), data.get("usage") or {}
+
+
+# gui_term_present and is_code_request are imported from mlxlib (shared with mlxcli).
+
+
+def request_messages_for_turn(messages, user_text):
+    if not is_code_request(user_text):
+        return messages
+    scoped = list(messages)
+    if scoped and scoped[0].get("role") == "system":
+        scoped[0] = {"role": "system", "content": scoped[0]["content"] + "\n\n" + CODE_REQUEST_SYSTEM}
+    else:
+        scoped.insert(0, {"role": "system", "content": CODE_REQUEST_SYSTEM})
+    return scoped
+
+
+def rag_candidate_files(folder):
+    root = pathlib.Path(folder).expanduser()
+    if not root.exists() or not root.is_dir():
+        raise RuntimeError(f"RAG folder not found: {root}")
+    files = []
+    for path in sorted(root.rglob("*")):
+        if len(files) >= RAG_MAX_FILES:
+            break
+        rel_parts = path.relative_to(root).parts
+        if any(part.startswith(".") for part in rel_parts):
+            continue
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if path.suffix.lower() in CONVERTIBLE or path.suffix.lower() in {".md", ".txt", ".csv", ".json"}:
+            files.append(path)
+    return files
+
+
+def rag_cache_dir(folder):
+    return pathlib.Path(folder).expanduser() / RAG_CACHE_DIRNAME
+
+
+def rag_cache_index_path(folder):
+    return rag_cache_dir(folder) / RAG_CACHE_INDEX
+
+
+def rag_load_cache_index(folder):
+    path = rag_cache_index_path(folder)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def rag_save_cache_index(folder, data):
+    cache_dir = rag_cache_dir(folder)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    rag_cache_index_path(folder).write_text(json.dumps(data, indent=2, sort_keys=True))
+
+
+def rag_cache_name(path, folder):
+    root = pathlib.Path(folder).expanduser()
+    rel = path.relative_to(root)
+    digest = hashlib.sha1(str(rel).encode("utf-8")).hexdigest()[:12]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", rel.stem).strip("._") or "document"
+    return f"{stem}-{digest}.md"
+
+
+def extract_candidate_name(text, label):
+    for line in text.splitlines():
+        cleaned = line.strip().strip("*#").strip()
+        if not cleaned:
+            continue
+        if len(cleaned) > 80:
+            continue
+        if any(ch.isdigit() for ch in cleaned):
+            continue
+        return cleaned
+    return pathlib.Path(label).stem
+
+
+def rag_chunks(text, label):
+    compact = re.sub(r"\s+", " ", text).strip()
+    if not compact:
+        return []
+    chunks = []
+    start = 0
+    while start < len(compact):
+        end = min(start + RAG_CHUNK_CHARS, len(compact))
+        chunks.append((label, compact[start:end]))
+        start = end
+    return chunks
+
+
+def score_rag_chunk(query, chunk_text):
+    terms = [term for term in re.findall(r"[A-Za-z0-9_]{3,}", query.lower()) if term]
+    if not terms:
+        return 0
+    lowered = chunk_text.lower()
+    return sum(lowered.count(term) for term in terms)
+
+
+def is_compare_all_rag_request(text):
+    lowered = text.lower()
+    compare_terms = ("compare", "rank", "ranking", "strengths", "weaknesses")
+    corpus_terms = ("resume", "resumes", "documents", "candidates", "folder")
+    return any(term in lowered for term in compare_terms) and any(term in lowered for term in corpus_terms)
+
+
+def rag_source_mtime(path):
+    return int(path.stat().st_mtime_ns)
+
+
+def rag_prepare_file(folder, path, index):
+    root = pathlib.Path(folder).expanduser()
+    rel = str(path.relative_to(root))
+    cache_dir = rag_cache_dir(root)
+    entry = index.get(rel, {})
+    source_mtime = rag_source_mtime(path)
+    cached_name = entry.get("cache_name") or rag_cache_name(path, root)
+    cached_path = cache_dir / cached_name
+    suffix = path.suffix.lower()
+    needs_refresh = (
+        entry.get("source_mtime_ns") != source_mtime
+        or not cached_path.exists()
+        or cached_path.stat().st_size == 0
+    )
+    converted = False
+
+    if suffix in CONVERTIBLE:
+        if needs_refresh:
+            text, _label = convert_file(path, "all")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cached_path.write_text(text)
+            converted = True
+        else:
+            text = cached_path.read_text(errors="replace")
+    else:
+        text = path.read_text(errors="replace")
+        if needs_refresh:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cached_path.write_text(text)
+
+    index[rel] = {
+        "cache_name": cached_name,
+        "label": f"{path.name} (cached markdown)",
+        "source_mtime_ns": source_mtime,
+        "cached_at": datetime.now().isoformat(timespec="seconds"),
+        "source_suffix": suffix,
+    }
+    return {
+        "relative_path": rel,
+        "path": path,
+        "text": text,
+        "label": index[rel]["label"],
+        "cache_path": cached_path,
+        "converted": converted,
+    }
+
+
+def rag_context_for_query(folder, user_text):
+    root = pathlib.Path(folder).expanduser()
+    files = rag_candidate_files(folder)
+    index = rag_load_cache_index(root)
+    converted = 0
+    indexed = 0
+    failed = []
+    compare_mode = is_compare_all_rag_request(user_text)
+    scored_matches = []
+    fallback_matches = []
+    file_labels = []
+    rebuilt = False
+
+    for path in files:
+        try:
+            record = rag_prepare_file(root, path, index)
+        except Exception as exc:
+            failed.append(f"{path.name}: {exc}")
+            continue
+        if record["converted"]:
+            converted += 1
+            rebuilt = True
+        indexed += 1
+        text = record["text"]
+        label = record["label"]
+        file_labels.append(label)
+        chunks = rag_chunks(text, label)
+        if not chunks:
+            failed.append(f"{path.name}: no usable text extracted")
+            continue
+        candidate_name = extract_candidate_name(text, path.name)
+        fallback_label = f"{candidate_name} | {label}"
+        fallback_matches.append((1, fallback_label, chunks[0][1][:RAG_COMPARE_CHARS]))
+        if compare_mode:
+            continue
+        for chunk_label, chunk_text in chunks:
+            score = score_rag_chunk(user_text, chunk_text)
+            if score > 0:
+                scored_matches.append((score, chunk_label, chunk_text))
+
+    stale_keys = {str(path.relative_to(root)) for path in files}
+    for rel in list(index):
+        if rel not in stale_keys:
+            cache_name = index.get(rel, {}).get("cache_name")
+            if cache_name:
+                try:
+                    (rag_cache_dir(root) / cache_name).unlink()
+                except FileNotFoundError:
+                    pass
+            del index[rel]
+            rebuilt = True
+    if rebuilt or not rag_cache_index_path(root).exists():
+        rag_save_cache_index(root, index)
+
+    if compare_mode:
+        matches = fallback_matches[:RAG_COMPARE_FILE_LIMIT]
+    else:
+        scored_matches.sort(key=lambda item: item[0], reverse=True)
+        matches = scored_matches[:RAG_MAX_CHUNKS] or fallback_matches[:RAG_MAX_CHUNKS]
+
+    return {
+        "folder": root,
+        "candidate_count": len(files),
+        "converted_count": converted,
+        "indexed_count": indexed,
+        "failed": failed,
+        "file_labels": file_labels,
+        "matches": matches,
+        "compare_mode": compare_mode,
+        "cache_dir": rag_cache_dir(root),
+    }
+
+
+def request_messages_with_context(messages, user_text, rag_folder):
+    scoped = request_messages_for_turn(messages, user_text)
+    statuses = []
+    urls = detect_urls(user_text)
+
+    remote_url, remote_key, remote_collection = rag_remote_config()
+    if remote_url:
+        try:
+            remote = rag_remote_search(user_text, remote_url, remote_key, remote_collection, limit=RAG_MAX_CHUNKS)
+            results = remote.get("results") or []
+            if results:
+                lines = [
+                    f"Remote RAG server: {remote_url}",
+                    f"Remote RAG collection: {remote_collection or '(all collections)'}",
+                    "Relevant excerpts from the remote RAG repository:",
+                ]
+                used = []
+                for result in results:
+                    label = f"{result.get('title') or result.get('filename')} chunk {result.get('chunk_index', 0)}"
+                    used.append(label)
+                    lines.append(f"\n[{label}]\n{result.get('content', '')}")
+                extra = RAG_USE_SYSTEM + "\n\n" + "\n".join(lines)
+                if scoped and scoped[0].get("role") == "system":
+                    scoped[0] = {"role": "system", "content": scoped[0]["content"] + "\n\n" + extra}
+                else:
+                    scoped.insert(0, {"role": "system", "content": extra})
+                statuses.append(f"Remote RAG used {len(results)} excerpt(s) from {', '.join(used)}")
+            else:
+                statuses.append(f"Remote RAG returned no matches ({remote_collection or 'all collections'})")
+        except Exception as exc:
+            statuses.append(f"Remote RAG unavailable: {exc}")
+
+    folder = (rag_folder or "").strip()
+    if folder:
+        context = rag_context_for_query(folder, user_text)
+        matches = context["matches"]
+        if matches:
+            content_lines = [
+                f"Chat RAG folder: {context['folder']}",
+                f"RAG files found: {context['candidate_count']}",
+                f"RAG files converted this pass: {context['converted_count']}",
+                f"RAG files indexed from cached markdown: {context['indexed_count']}",
+                f"RAG markdown cache: {context['cache_dir']}",
+                "Relevant reference excerpts from the chat RAG folder:",
+            ]
+            if context["file_labels"]:
+                content_lines.append("Files represented in this RAG context:")
+                content_lines.append(", ".join(context["file_labels"]))
+            used_labels = []
+            for _score, label, chunk_text in matches:
+                used_labels.append(label)
+                content_lines.append(f"\n[{label}]\n{chunk_text}")
+            content_lines.append(
+                "\nTreat the represented files above as the available documents for this turn. "
+                "Use the provided excerpts to compare the source files that are represented here. "
+                "If the request asks for ranking, rank the represented files directly. "
+                "When possible, list every represented candidate by name. "
+                "If some files are represented only partially, still analyze and rank the represented set rather than asking "
+                "the user to paste the resumes again."
+            )
+            extra = RAG_USE_SYSTEM + "\n\n" + "\n".join(content_lines)
+            if scoped and scoped[0].get("role") == "system":
+                scoped[0] = {"role": "system", "content": scoped[0]["content"] + "\n\n" + extra}
+            else:
+                scoped.insert(0, {"role": "system", "content": extra})
+            failed_note = ""
+            if context["failed"]:
+                failed_names = ", ".join(item.split(":", 1)[0] for item in context["failed"][:6])
+                failed_note = f"; {len(context['failed'])} file(s) failed conversion: {failed_names}"
+            statuses.append(
+                f"RAG found {context['candidate_count']} file(s), converted {context['converted_count']}, "
+                f"indexed {context['indexed_count']}, "
+                f"used {len(matches)} excerpt(s) from {', '.join(dict.fromkeys(used_labels))}{failed_note}"
+            )
+        else:
+            statuses.append("No usable RAG excerpts were found in the selected folder.")
+
+    if urls:
+        fetched = []
+        for url in urls:
+            try:
+                fetched.append(fetch_url_context(url))
+            except Exception as exc:
+                if not fetched:
+                    return scoped, None, f"Unable to retrieve {url}: {exc}"
+                statuses.append(f"URL fetch skipped {url}: {exc}")
+        if fetched:
+            content_lines = ["Fetched web page content for this turn:"]
+            for item in fetched:
+                content_lines.append(
+                    f"\n[URL]\nTitle: {item['title']}\nURL: {item['url']}\nContent-Type: {item['content_type']}\nExcerpt:\n{item['text']}"
+                )
+            extra = URL_USE_SYSTEM + "\n\n" + "\n".join(content_lines)
+            if scoped and scoped[0].get("role") == "system":
+                scoped[0] = {"role": "system", "content": scoped[0]["content"] + "\n\n" + extra}
+            else:
+                scoped.insert(0, {"role": "system", "content": extra})
+            statuses.append(
+                f"Fetched {len(fetched)} URL(s): {', '.join(item['title'] for item in fetched)}"
+            )
+
+    status_text = " | ".join(statuses) if statuses else None
+    return scoped, status_text, None
+
+
+def system_resource_snapshot():
+    def sysctl(name):
+        try:
+            out = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=5)
+            return int(out.stdout.strip())
+        except Exception:
+            return None
+
+    snapshot = {
+        "total": sysctl("hw.memsize"),
+        "metal_cap": sysctl("iogpu.wired_limit_mb"),
+        "free": None,
+        "reclaimable": None,
+        "top": [],
+        "errors": [],
+    }
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        match = re.search(r"page size of (\d+)", vm)
+        page = int(match.group(1)) if match else 16384
+
+        def pages(label):
+            found = re.search(label + r":\s+(\d+)", vm)
+            return int(found.group(1)) * page if found else 0
+
+        free = pages("Pages free")
+        snapshot["free"] = free
+        snapshot["reclaimable"] = free + pages("Pages inactive") + pages("Pages purgeable")
+    except Exception as exc:
+        snapshot["errors"].append(f"vm_stat unavailable: {exc}")
+    try:
+        ps = subprocess.run(["ps", "axo", "rss=,comm="], capture_output=True, text=True, timeout=5)
+        rows = []
+        for line in ps.stdout.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                rows.append((int(parts[0]), parts[1]))
+        rows.sort(reverse=True)
+        for rss, command in rows:
+            mb = rss // 1024
+            if mb < 300 or len(snapshot["top"]) >= 10:
+                break
+            if ".app/" in command:
+                segment = command.split("/Applications/")[-1]
+                name = segment.split(".app/")[0] if ".app/" in segment else command.rsplit("/", 1)[-1]
+            else:
+                name = command.rsplit("/", 1)[-1]
+            tag = " <- oMLX" if "omlx" in command.lower() else ""
+            snapshot["top"].append((mb, name, tag))
+    except Exception as exc:
+        snapshot["errors"].append(f"ps unavailable: {exc}")
+    return snapshot
+
+
+def system_resource_lines():
+    lines = []
+    snapshot = system_resource_snapshot()
+    total = snapshot["total"]
+    cap = snapshot["metal_cap"]
+    if total:
+        lines.append(f"- Total RAM: {total / 2**30:.1f} GB")
+    if cap:
+        lines.append(f"- Metal cap: {cap / 1024:.1f} GB")
+    if snapshot["free"] is not None:
+        lines.append(f"- Free now: {snapshot['free'] / 2**30:.1f} GB")
+    if snapshot["reclaimable"] is not None:
+        lines.append(f"- Reclaimable: {snapshot['reclaimable'] / 2**30:.1f} GB")
+    lines.extend(f"- {error}" for error in snapshot["errors"])
+    lines.append("")
+    lines.append("Top Memory Users")
+    if snapshot["top"]:
+        for mb, name, tag in snapshot["top"]:
+            lines.append(f"- {mb:>6} MB  {name}{tag}")
+    else:
+        lines.append("- Nothing over 300 MB")
+    return lines
+
+
+def _sysctl_int(name):
+    try:
+        out = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=5)
+        return int(out.stdout.strip())
+    except Exception:
+        return None
+
+
+_ECORE_COUNT = None
+
+
+def _ecore_count():
+    global _ECORE_COUNT
+    if _ECORE_COUNT is None:
+        levels = _sysctl_int("hw.nperflevels") or 0
+        _ECORE_COUNT = (_sysctl_int("hw.perflevel1.logicalcpu") or 0) if levels >= 2 else 0
+    return _ECORE_COUNT
+
+
+def read_cpu_split():
+    """(e_fraction, p_fraction) usage, each 0..1 or None if unavailable.
+
+    Apple Silicon enumerates the efficiency cluster first in per-core
+    ordering (same convention oMLX's Mach-tick sampler relies on), so a
+    plain index split against hw.perflevel1.logicalcpu approximates the
+    E/P breakdown without needing raw Mach ticks.
+    """
+    if psutil is None:
+        return None, None
+    try:
+        percore = psutil.cpu_percent(percpu=True)
+    except Exception:
+        return None, None
+    if not percore:
+        return None, None
+    e_count = _ecore_count()
+    if not e_count or e_count >= len(percore):
+        avg = sum(percore) / len(percore) / 100
+        return avg, avg
+    e_vals = percore[:e_count]
+    p_vals = percore[e_count:]
+    e_frac = (sum(e_vals) / len(e_vals) / 100) if e_vals else None
+    p_frac = (sum(p_vals) / len(p_vals) / 100) if p_vals else None
+    return e_frac, p_frac
+
+
+def read_gpu_stats():
+    """(usage_fraction, memory_in_use_bytes) from the IOAccelerator
+    PerformanceStatistics dictionary — the same public IOKit registry entry
+    oMLX's SystemStatsSampler reads."""
+    try:
+        out = subprocess.run(
+            ["ioreg", "-r", "-c", "IOAccelerator", "-d", "1"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return None, None
+    match = re.search(r'"PerformanceStatistics"\s*=\s*\{([^}]*)\}', out)
+    if not match:
+        return None, None
+    block = match.group(1)
+    util_m = re.search(r'"Device Utilization %"\s*=\s*(\d+)', block)
+    mem_m = re.search(r'"In use system memory"\s*=\s*(\d+)', block)
+    usage = min(1.0, int(util_m.group(1)) / 100) if util_m else None
+    memory = int(mem_m.group(1)) if mem_m else None
+    return usage, memory
+
+
+def read_memory_breakdown():
+    """Wired/active/compressed/free bytes, matching oMLX's Memory panel
+    categorization (vm_stat is the userspace-safe stand-in for
+    vm_statistics64 here)."""
+    total = _sysctl_int("hw.memsize") or 0
+    result = {"total": total, "wired": 0, "active": 0, "compressed": 0, "free": 0}
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return result
+    page_match = re.search(r"page size of (\d+)", vm)
+    page = int(page_match.group(1)) if page_match else 16384
+
+    def pages(label):
+        found = re.search(label + r":\s+(\d+)", vm)
+        return int(found.group(1)) * page if found else 0
+
+    result["wired"] = pages("Pages wired down")
+    result["active"] = pages("Pages active")
+    result["compressed"] = pages("Pages occupied by compressor")
+    used = result["wired"] + result["active"] + result["compressed"]
+    result["free"] = max(total - used, 0) if total else 0
+    return result
+
+
+def read_load_and_uptime():
+    try:
+        loads = os.getloadavg()
+    except Exception:
+        loads = None
+    uptime = None
+    boottime = _sysctl_int("kern.boottime")
+    if boottime:
+        uptime = max(0, time.time() - boottime)
+    elif psutil is not None:
+        try:
+            uptime = max(0, time.time() - psutil.boot_time())
+        except Exception:
+            uptime = None
+    return loads, uptime
+
+
+def read_thermal_state():
+    """Best-effort stand-in for ProcessInfo.thermalState — pmset's therm
+    report is the closest unprivileged signal available from Python."""
+    try:
+        out = subprocess.run(["pmset", "-g", "therm"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return "Unknown"
+    speed_m = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", out)
+    sched_m = re.search(r"CPU_Scheduler_Limit\s*=\s*(\d+)", out)
+    speed = int(speed_m.group(1)) if speed_m else 100
+    sched = int(sched_m.group(1)) if sched_m else 100
+    limit = min(speed, sched)
+    if limit >= 100:
+        return "Nominal"
+    if limit >= 80:
+        return "Fair"
+    if limit >= 50:
+        return "Serious"
+    return "Critical"
+
+
+def format_bytes_gb(num_bytes):
+    gb = num_bytes / 1_000_000_000
+    if gb >= 1:
+        return f"{gb:.2f} GB"
+    return f"{num_bytes / 1_000_000:.0f} MB"
+
+
+def format_uptime(seconds):
+    if seconds is None:
+        return "–"
+    minutes = int(seconds) // 60
+    hours = minutes // 60
+    days = hours // 24
+    if days >= 1:
+        return f"{days}d {hours % 24}h"
+    if hours >= 1:
+        return f"{hours}h {minutes % 60}m"
+    return f"{max(0, minutes)}m"
+
+
+def trim(messages):
+    starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if len(starts) > MAX_HISTORY_TURNS:
+        cut = starts[-MAX_HISTORY_TURNS]
+        messages = [messages[0]] + messages[cut:]
+    if sum(len(str(m.get("content") or "")) for m in messages) <= MAX_CONTEXT_CHARS:
+        return messages
+    system = messages[:1]
+    kept = []
+    total = sum(len(str(m.get("content") or "")) for m in system)
+    for message in reversed(messages[1:]):
+        size = len(str(message.get("content") or ""))
+        if kept and total + size > MAX_CONTEXT_CHARS:
+            break
+        kept.append(message)
+        total += size
+    return system + list(reversed(kept))
+
+
+# gui_should_auto_enable_agentic, gui_execution_contract, gui_tool_failed,
+# gui_normalize_tool_name, and gui_infer_command_cwd are imported from mlxlib
+# (shared with mlxcli).
+
+
+def parse_gui_text_tool_calls(content):
+    if not content or "call:" not in content:
+        return []
+    patterns = (
+        ("run_command", r"call:(?:(?:[A-Za-z0-9_]+)[.:])*run_command\s*\{\s*command:\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+        ("read_file", r"call:(?:(?:[A-Za-z0-9_]+)[.:])*read_file\s*\{\s*path:\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+        ("write_file", r"call:(?:(?:[A-Za-z0-9_]+)[.:])*write_file\s*\{\s*path:\s*(\"(?:\\.|[^\"])*\")\s*,\s*(?:content|text):\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+        ("python_interpreter", r"call:python_interpreter\s*\{\s*code:\s*(\"(?:\\.|[^\"])*\")\s*\}"),
+    )
+    calls = []
+    for name, pattern in patterns:
+        for match in re.finditer(pattern, content, flags=re.DOTALL):
+            try:
+                first = json.loads(match.group(1))
+                if name == "write_file":
+                    second = re.search(r"(?:content|text):\s*(\"(?:\\.|[^\"])*\")", match.group(0), flags=re.DOTALL)
+                    args = {"path": first, "content": json.loads(second.group(1))} if second else {}
+                elif name == "run_command":
+                    args = {"command": first}
+                elif name == "read_file":
+                    args = {"path": first}
+                else:
+                    args = {"code": first}
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            calls.append({"id": gui_unique_call_id("gui_text_call"), "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args)}})
+    return calls
+
+
+def markdown_to_text(markdown):
+    lines = []
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            stripped = stripped.lstrip("#").strip()
+        elif stripped.startswith(("- ", "* ")):
+            stripped = "- " + stripped[2:].strip()
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
+def paragraph_xml(text, style=None):
+    p_pr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
+    runs = []
+    for part in text.split("\n"):
+        if runs:
+            runs.append("<w:br/>")
+        runs.append(f"<w:t>{escape(part)}</w:t>")
+    return f"<w:p>{p_pr}<w:r>{''.join(runs)}</w:r></w:p>"
+
+
+def markdown_to_docx(path, title, markdown):
+    if formatted_markdown_to_docx is not None:
+        return formatted_markdown_to_docx(path, title, markdown)
+    body = [paragraph_xml(title, "Title")]
+    body.append(paragraph_xml(f"Exported {datetime.now().strftime('%Y-%m-%d %H:%M')}"))
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            body.append(paragraph_xml(""))
+        elif stripped.startswith("### "):
+            body.append(paragraph_xml(stripped[4:], "Heading3"))
+        elif stripped.startswith("## "):
+            body.append(paragraph_xml(stripped[3:], "Heading2"))
+        elif stripped.startswith("# "):
+            body.append(paragraph_xml(stripped[2:], "Heading1"))
+        elif stripped.startswith(("- ", "* ")):
+            body.append(paragraph_xml("- " + stripped[2:]))
+        else:
+            body.append(paragraph_xml(stripped))
+
+    document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    {''.join(body)}
+    <w:sectPr>
+      <w:pgSz w:w="12240" w:h="15840"/>
+      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>
+    </w:sectPr>
+  </w:body>
+</w:document>'''
+    styles_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+    <w:name w:val="Normal"/>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr>
+    <w:pPr><w:spacing w:after="120" w:line="300" w:lineRule="auto"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Title">
+    <w:name w:val="Title"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="0B2545"/><w:sz w:val="48"/></w:rPr>
+    <w:pPr><w:spacing w:after="200"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="2E74B5"/><w:sz w:val="32"/></w:rPr>
+    <w:pPr><w:spacing w:before="360" w:after="200"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading2">
+    <w:name w:val="heading 2"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="2E74B5"/><w:sz w:val="26"/></w:rPr>
+    <w:pPr><w:spacing w:before="280" w:after="140"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading3">
+    <w:name w:val="heading 3"/><w:basedOn w:val="Normal"/>
+    <w:rPr><w:b/><w:color w:val="1F4D78"/><w:sz w:val="24"/></w:rPr>
+    <w:pPr><w:spacing w:before="200" w:after="100"/></w:pPr>
+  </w:style>
+</w:styles>'''
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+</Types>'''
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>'''
+    doc_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("word/_rels/document.xml.rels", doc_rels)
+        zf.writestr("word/document.xml", document_xml)
+        zf.writestr("word/styles.xml", styles_xml)
+
+
+class MlxGui(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("mlxgui")
+        self.geometry("920x680")
+        self.minsize(720, 500)
+
+        self.backend = load_backend()
+        self.url, self.key = load_backend_cfg(self.backend)
+        self.system_prompt = load_system_prompt()
+        self.gui_defaults = load_gui_defaults()
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+        notes_path, notes_text = find_project_notes()
+        if notes_text:
+            self.messages[0]["content"] += f"\n\nProject notes from {notes_path}:\n\n{notes_text}"
+        artifact_note = last_artifact_system_note()
+        if artifact_note:
+            self.messages[0]["content"] += f"\n\n{artifact_note}"
+        self.totals = {"in": 0, "out": 0}
+        self.last_turn_tokens = {"in": 0, "out": 0}
+        self.events = queue.Queue()
+        self.model_display_to_id = {}
+        self.model_var = tk.StringVar()
+        self.backend_var = tk.StringVar(value=backend_label(self.backend))
+        self.convert_var = tk.StringVar(value=self.gui_defaults["convert_mode"])
+        self.chat_rag_folder_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(value="Starting")
+        self.tokens_var = tk.StringVar(value="tokens: in 0 / out 0")
+        self.resource_var = tk.StringVar(value="Context: OK")
+        self.memory_var = tk.StringVar(value="Resources: ...")
+        self.working_var = tk.StringVar(value="")
+        self.busy = False
+        self.refining = False
+        self.last_user_text = ""
+        self.current_stream_start = None
+        self.current_stream_end = None
+        self.turn_start_time = None
+        self.working_started_at = None
+        self.working_after = None
+        self.indicator_active = False
+        self.indicator_start_index = None
+        self.indicator_label = ""
+        self.indicator_frame = 0
+        self.indicator_after = None
+        self.resource_after = None
+        self.context_widget = None
+        self.cancel_requested = False
+        self.pending_user_index = None
+
+        self.build_ui()
+        self.after(80, self.choose_backend_on_launch)
+        self.update_memory_indicator()
+        self.start_resource_refresh()
+        self.after(60, self.drain_events)
+        self.after(300, lambda: self.check_repo_updates_async(TURBO_QWEN_ROOT, "Qwen fork", silent=True))
+        self.after(300, lambda: self.check_model_updates_async(
+            "mlx-community/Qwen3.6-35B-A3B-4bit",
+            pathlib.Path.home() / ".omlx" / "model_update_cache.json",
+            "Qwen 3.6 35B-A3B", silent=True))
+
+    def build_ui(self):
+        self.build_menu()
+        self.build_hero()
+        top = ttk.Frame(self, padding=(10, 8))
+        top.pack(fill="x")
+
+        ttk.Label(top, text="Model").pack(side="left")
+        self.model_box = ttk.Combobox(top, textvariable=self.model_var, state="readonly", width=38)
+        self.model_box.pack(side="left", padx=(6, 12))
+
+        ttk.Label(top, text="Backend").pack(side="left")
+        self.backend_box = ttk.Combobox(
+            top,
+            textvariable=self.backend_var,
+            state="readonly",
+            values=[backend_label(name) for name in SUPPORTED_BACKENDS],
+            width=30,
+        )
+        self.backend_box.pack(side="left", padx=(6, 12))
+        self.backend_box.bind("<<ComboboxSelected>>", self.backend_selection_changed)
+
+        ttk.Button(top, text="New Chat", command=self.new_chat).pack(side="left", padx=(0, 6))
+        ttk.Button(top, text="Clear", command=self.clear_chat).pack(side="left", padx=(0, 6))
+        ttk.Button(top, text="Import", command=self.import_files).pack(side="left")
+        ttk.Button(top, text="Settings", command=self.open_settings).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Model Settings", command=self.open_model_settings).pack(side="left", padx=(6, 0))
+        ttk.Label(top, textvariable=self.tokens_var).pack(side="right")
+        ttk.Label(top, textvariable=self.resource_var).pack(side="right", padx=(0, 12))
+
+        chat_frame = ttk.Frame(self)
+        chat_frame.pack(fill="both", expand=True, padx=10)
+        ttk.Label(chat_frame, text="Conversation").pack(anchor="w")
+        self.chat = tk.Text(chat_frame, wrap="word", padx=10, pady=10, undo=True)
+        chat_scroll = ttk.Scrollbar(chat_frame, orient="vertical", command=self.chat.yview)
+        self.chat.configure(yscrollcommand=chat_scroll.set)
+        self.chat.pack(side="left", fill="both", expand=True)
+        chat_scroll.pack(side="right", fill="y")
+        body_font = tkfont.Font(family="Georgia", size=16)
+        label_font = tkfont.Font(family="Helvetica", size=13)
+        small_font = tkfont.Font(family="Helvetica", size=11)
+        heading_font = tkfont.Font(family="Helvetica", size=19, weight="bold")
+        subheading_font = tkfont.Font(family="Helvetica", size=16, weight="bold")
+        self.chat.configure(
+            state="normal",
+            background="#ffffff",
+            borderwidth=0,
+            font=body_font,
+            insertbackground="#111111",
+            relief="flat",
+            selectbackground="#2f6fed",
+            selectforeground="#ffffff",
+        )
+        self.chat.tag_configure(
+            "user_bubble",
+            justify="right",
+            background="#f2f1ef",
+            foreground="#202020",
+            font=tkfont.Font(family="Helvetica", size=17),
+            lmargin1=180,
+            lmargin2=180,
+            rmargin=24,
+            spacing1=12,
+            spacing3=18,
+        )
+        self.chat.tag_configure(
+            "assistant_label",
+            foreground="#7a7a73",
+            font=label_font,
+            spacing1=14,
+            spacing3=8,
+        )
+        self.chat.tag_configure(
+            "assistant_body",
+            foreground="#0f0f0f",
+            background="#f7f7f5",
+            font=body_font,
+            lmargin1=24,
+            lmargin2=24,
+            rmargin=40,
+            spacing1=8,
+            spacing3=10,
+        )
+        self.chat.tag_configure("meta", foreground="#667085", font=small_font, spacing1=8, spacing3=8)
+        working_font = tkfont.Font(family="Helvetica", size=13, slant="italic")
+        self.chat.tag_configure("working_indicator", foreground="#8a8f98", font=working_font, spacing1=4, spacing3=4)
+        self.chat.tag_configure(
+            "heading",
+            foreground="#111111",
+            background="#f7f7f5",
+            font=heading_font,
+            lmargin1=24,
+            lmargin2=24,
+            rmargin=40,
+            spacing1=14,
+            spacing3=8,
+        )
+        self.chat.tag_configure(
+            "subheading",
+            foreground="#252525",
+            background="#f7f7f5",
+            font=subheading_font,
+            lmargin1=24,
+            lmargin2=24,
+            rmargin=40,
+            spacing1=10,
+            spacing3=6,
+        )
+        self.chat.tag_configure(
+            "bullet",
+            foreground="#0f0f0f",
+            background="#f7f7f5",
+            font=body_font,
+            lmargin1=46,
+            lmargin2=66,
+            rmargin=40,
+            spacing1=3,
+            spacing3=5,
+        )
+        self.chat.tag_configure(
+            "code",
+            foreground="#111827",
+            background="#e9edf3",
+            font=tkfont.Font(family="Menlo", size=13, weight="bold"),
+        )
+        self.chat.tag_configure(
+            "code_block",
+            foreground="#064e3b",
+            background="#eef6ef",
+            font=tkfont.Font(family="Menlo", size=14, weight="bold"),
+            lmargin1=38,
+            lmargin2=38,
+            rmargin=38,
+            spacing1=8,
+            spacing3=8,
+        )
+        self.raise_text_selection()
+        self.chat.bind("<ButtonRelease-1>", lambda _event: self.raise_text_selection())
+        self.bind_text_context_menu(self.chat)
+
+        bottom = ttk.Frame(self, padding=10)
+        bottom.pack(fill="x")
+        self.input = tk.Text(bottom, height=3, wrap="word", undo=True)
+        self.input.configure(
+            background="#fbfbfa",
+            borderwidth=1,
+            padx=10,
+            pady=8,
+            relief="solid",
+            selectbackground="#2f6fed",
+            selectforeground="#ffffff",
+        )
+        self.input.pack(side="left", fill="x", expand=True)
+        self.input.bind("<Return>", self.send_from_keyboard)
+        self.input.bind("<Shift-Return>", lambda _event: None)
+        self.input.bind("<<Paste>>", self.paste_into_input)
+        self.bind_text_context_menu(self.input)
+        ttk.Button(bottom, text="Paste", command=self.paste_into_input).pack(side="left", padx=(8, 0))
+        ttk.Button(bottom, text="Add File", command=self.insert_file_references).pack(side="left", padx=(8, 0))
+        self.refine_button = ttk.Button(bottom, text="Refine", command=self.refine_prompt)
+        self.refine_button.pack(side="left", padx=(8, 0))
+        self.send_button = ttk.Button(bottom, text="Send", command=self.send)
+        self.send_button.pack(side="left", padx=(8, 0))
+
+        status_bar = ttk.Frame(self, padding=(10, 0, 10, 8))
+        status_bar.pack(fill="x")
+        ttk.Label(status_bar, textvariable=self.working_var, width=10).pack(side="left")
+        ttk.Label(status_bar, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True)
+        ttk.Label(status_bar, textvariable=self.memory_var, anchor="e").pack(side="right", padx=(12, 0))
+
+    def build_hero(self):
+        hero = ttk.Frame(self, padding=(14, 10, 14, 2))
+        hero.pack(fill="x")
+
+        self._hero_icon = None
+        try:
+            icon = tk.PhotoImage(file=str(MLXGUI_ICON_PATH))
+            if icon.width() > 48:
+                factor = max(1, icon.width() // 48)
+                icon = icon.subsample(factor, factor)
+            self._hero_icon = icon
+            ttk.Label(hero, image=icon).pack(side="left", padx=(0, 12))
+        except Exception:
+            pass
+
+        hero_text = ttk.Frame(hero)
+        hero_text.pack(side="left", fill="x", expand=True)
+        title_row = ttk.Frame(hero_text)
+        title_row.pack(anchor="w")
+        ttk.Label(
+            title_row, text="mlxgui",
+            font=tkfont.Font(family="Helvetica", size=18, weight="bold"),
+        ).pack(side="left")
+        self.status_dot = tk.Canvas(title_row, width=12, height=12, highlightthickness=0)
+        self.status_dot.pack(side="left", padx=(10, 4))
+        self._status_dot_item = self.status_dot.create_oval(2, 2, 10, 10, fill="#9a9a9a", outline="")
+        self.server_status_var = tk.StringVar(value="Checking...")
+        ttk.Label(title_row, textvariable=self.server_status_var, foreground="#666666").pack(side="left")
+        self.hero_subtitle_var = tk.StringVar(value="")
+        ttk.Label(hero_text, textvariable=self.hero_subtitle_var, foreground="#888888").pack(anchor="w")
+
+        ttk.Button(hero, text="System Stats...", command=self.open_system_stats).pack(side="right", anchor="ne")
+        self.repo_update_var = tk.StringVar(value="")
+        self.repo_update_label = ttk.Label(
+            title_row, textvariable=self.repo_update_var,
+            foreground="#d9822b", cursor="hand2",
+        )
+        self.repo_update_label.bind("<Button-1>", self.show_repo_update_details)
+        self.model_update_var = tk.StringVar(value="")
+        self.model_update_label = ttk.Label(
+            title_row, textvariable=self.model_update_var,
+            foreground="#d9822b", cursor="hand2",
+        )
+        self.model_update_label.bind("<Button-1>", self.show_model_update_details)
+        self.update_hero_subtitle()
+
+    def update_hero_subtitle(self):
+        self.hero_subtitle_var.set(f"{backend_label(self.backend)}  ·  {self.url}")
+
+    def check_repo_updates_async(self, root, label, silent=True):
+        def worker():
+            info = compute_repo_update_status(root)
+            self.events.put(("repo_updates", label, info, silent))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def check_model_updates_async(self, repo_id, cache_path, label, silent=True):
+        def worker():
+            info = compute_model_update_status(repo_id, cache_path)
+            self.events.put(("model_updates", label, info, silent))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_model_update_indicator(self, label, info):
+        lines = [
+            f"Upstream model {label} ({info['repo_id']}) has changed:",
+            f"  new revision {info['new_sha'][:10]} (was {info['previous_sha'][:10]})",
+            f"  last modified {info['last_modified']}",
+            "\nThis only checks Hugging Face repo metadata — nothing is "
+            "downloaded, converted, or applied automatically. Re-run the "
+            "conversion pipeline manually if you want to pick up the change.",
+        ]
+        self.model_update_var.set(f"⬆ Model update: {label}")
+        self.model_update_label.pack(side="left", padx=(10, 0))
+        self.model_update_details = "\n".join(lines)
+
+    def show_model_update_details(self, _event=None):
+        details = getattr(self, "model_update_details", None)
+        if details:
+            messagebox.showinfo("Model update available", details, parent=self)
+
+    def show_repo_update_indicator(self, label, info):
+        lines = [f"{label} ({info['branch']}) has updates available:"]
+        for remote_ref, count in info["remotes"].items():
+            lines.append(f"  {remote_ref}: {count} new commit{'s' if count != 1 else ''}")
+        lines.append(
+            "\nThis only checks and fetches — nothing is pulled or rebuilt "
+            "automatically. Merge on a separate branch, build, and test on "
+            "an alternate port before touching the running server."
+        )
+        self.repo_update_var.set(f"⬆ Updates available: {label}")
+        self.repo_update_label.pack(side="left", padx=(10, 0))
+        self.repo_update_details = "\n".join(lines)
+
+    def show_repo_update_details(self, _event=None):
+        details = getattr(self, "repo_update_details", None)
+        if details:
+            messagebox.showinfo("Repo updates", details, parent=self)
+
+    def check_repo_updates_menu(self):
+        self.status_var.set("Checking turbo-fieldfare-qwen for updates...")
+        self.check_repo_updates_async(TURBO_QWEN_ROOT, "Qwen fork", silent=False)
+
+    def update_hero_status(self, reachable):
+        color = "#2ecc71" if reachable else "#9a9a9a"
+        text = "Connected" if reachable else "Unreachable"
+        try:
+            self.status_dot.itemconfigure(self._status_dot_item, fill=color)
+        except Exception:
+            pass
+        self.server_status_var.set(text)
+
+    def open_system_stats(self):
+        win = tk.Toplevel(self)
+        win.title("System Stats")
+        win.geometry("340x560")
+        win.transient(self)
+        win.resizable(False, False)
+
+        mono = tkfont.Font(family="Menlo", size=11)
+        bold = tkfont.Font(family="Helvetica", size=11, weight="bold")
+        small = tkfont.Font(family="Helvetica", size=9)
+
+        container = ttk.Frame(win, padding=14)
+        container.pack(fill="both", expand=True)
+
+        def section(title):
+            ttk.Label(container, text=title.upper(), font=bold, foreground="#2f6fed").pack(
+                anchor="center", pady=(10, 4)
+            )
+
+        def bar_row(label_text, color):
+            row = ttk.Frame(container)
+            row.pack(fill="x", pady=(2, 0))
+            ttk.Label(row, text=label_text, font=small).pack(side="left")
+            value_var = tk.StringVar(value="–")
+            ttk.Label(row, textvariable=value_var, font=mono).pack(side="right")
+            canvas = tk.Canvas(container, height=8, highlightthickness=0)
+            canvas.pack(fill="x", pady=(1, 6))
+            return value_var, canvas, color
+
+        def draw_bar(canvas, fraction, color):
+            canvas.delete("all")
+            width = max(canvas.winfo_width(), 1)
+            height = 8
+            canvas.create_rectangle(0, 0, width, height, fill="#e6e6e6", outline="")
+            if fraction is not None:
+                fill_w = max(3, width * min(1, max(0, fraction)))
+                canvas.create_rectangle(0, 0, fill_w, height, fill=color, outline="")
+
+        section("CPU")
+        e_val, e_canvas, e_color = bar_row("E-cores", "#f0932b")
+        p_val, p_canvas, p_color = bar_row("P-cores", "#2f6fed")
+        cpu_caption = tk.StringVar(value="")
+        ttk.Label(container, textvariable=cpu_caption, font=small, foreground="#999999").pack(anchor="w")
+        thermal_row = ttk.Frame(container)
+        thermal_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(thermal_row, text="Thermal", font=small).pack(side="left")
+        thermal_val = tk.StringVar(value="–")
+        ttk.Label(thermal_row, textvariable=thermal_val, font=mono).pack(side="right")
+        load_row = ttk.Frame(container)
+        load_row.pack(fill="x")
+        ttk.Label(load_row, text="Load avg", font=small).pack(side="left")
+        load_val = tk.StringVar(value="–")
+        ttk.Label(load_row, textvariable=load_val, font=mono).pack(side="right")
+        uptime_row = ttk.Frame(container)
+        uptime_row.pack(fill="x")
+        ttk.Label(uptime_row, text="Uptime", font=small).pack(side="left")
+        uptime_val = tk.StringVar(value="–")
+        ttk.Label(uptime_row, textvariable=uptime_val, font=mono).pack(side="right")
+
+        section("GPU")
+        gpu_val, gpu_canvas, gpu_color = bar_row("GPU", "#20bf6b")
+        gpu_mem_val, gpu_mem_canvas, gpu_mem_color = bar_row("GPU memory", "#22a6b3")
+
+        section("Memory")
+        mem_summary = tk.StringVar(value="–")
+        ttk.Label(container, textvariable=mem_summary, font=mono).pack(anchor="w")
+        seg_canvas = tk.Canvas(container, height=10, highlightthickness=0)
+        seg_canvas.pack(fill="x", pady=(4, 8))
+        legend = ttk.Frame(container)
+        legend.pack(fill="x")
+        legend_vars = {}
+        for key, color, label_text in [
+            ("wired", "#2f6fed", "Wired"),
+            ("active", "#eb4d4b", "Active"),
+            ("compressed", "#a55eea", "Compressed"),
+            ("free", "#c8c8c8", "Free"),
+        ]:
+            row = ttk.Frame(legend)
+            row.pack(fill="x", pady=1)
+            dot = tk.Canvas(row, width=8, height=8, highlightthickness=0)
+            dot.pack(side="left", padx=(0, 6))
+            dot.create_oval(0, 0, 8, 8, fill=color, outline="")
+            ttk.Label(row, text=label_text, font=small).pack(side="left")
+            value_var = tk.StringVar(value="–")
+            ttk.Label(row, textvariable=value_var, font=mono).pack(side="right")
+            legend_vars[key] = value_var
+
+        state = {"after": None}
+
+        def refresh():
+            e_frac, p_frac = read_cpu_split()
+            draw_bar(e_canvas, e_frac, e_color)
+            draw_bar(p_canvas, p_frac, p_color)
+            e_val.set(f"{e_frac * 100:.0f}%" if e_frac is not None else "–")
+            p_val.set(f"{p_frac * 100:.0f}%" if p_frac is not None else "–")
+            cpu_caption.set("E (amber) / P (blue) usage")
+            thermal_val.set(read_thermal_state())
+            loads, uptime = read_load_and_uptime()
+            load_val.set(" · ".join(f"{v:.2f}" for v in loads) if loads else "–")
+            uptime_val.set(format_uptime(uptime))
+
+            gpu_frac, gpu_mem_bytes = read_gpu_stats()
+            draw_bar(gpu_canvas, gpu_frac, gpu_color)
+            gpu_val.set(f"{gpu_frac * 100:.0f}%" if gpu_frac is not None else "–")
+            mem = read_memory_breakdown()
+            gpu_mem_frac = (gpu_mem_bytes / mem["total"]) if gpu_mem_bytes and mem["total"] else None
+            draw_bar(gpu_mem_canvas, gpu_mem_frac, gpu_mem_color)
+            gpu_mem_val.set(format_bytes_gb(gpu_mem_bytes) + " in use" if gpu_mem_bytes else "–")
+
+            used = mem["wired"] + mem["active"] + mem["compressed"]
+            mem_summary.set(
+                f"{format_bytes_gb(used)} / {mem['total'] / 1_000_000_000:.0f} GB"
+                f"  ({used / mem['total'] * 100:.0f}%)" if mem["total"] else "–"
+            )
+            seg_canvas.delete("all")
+            width = max(seg_canvas.winfo_width(), 1)
+            x = 0
+            total = mem["total"] or 1
+            for key, color in [("wired", "#2f6fed"), ("active", "#eb4d4b"), ("compressed", "#a55eea")]:
+                seg_w = width * mem[key] / total
+                if seg_w > 0.5:
+                    seg_canvas.create_rectangle(x, 0, x + seg_w, 10, fill=color, outline="")
+                    x += seg_w
+            seg_canvas.create_rectangle(x, 0, width, 10, fill="#e6e6e6", outline="")
+            for key in ("wired", "active", "compressed", "free"):
+                legend_vars[key].set(format_bytes_gb(mem[key]))
+
+            state["after"] = win.after(STATS_REFRESH_MS, refresh)
+
+        def on_close():
+            if state["after"] is not None:
+                win.after_cancel(state["after"])
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        win.after(50, refresh)
+
+    def open_model_settings(self):
+        backend = self.backend
+        settings = load_model_settings(backend)
+        win = tk.Toplevel(self)
+        win.title(f"Model Settings — {backend_label(backend)}")
+        win.geometry("420x360")
+        win.transient(self)
+        win.resizable(False, False)
+
+        container = ttk.Frame(win, padding=16)
+        container.pack(fill="both", expand=True)
+        ttk.Label(
+            container,
+            text=f"Sampling parameters for {backend_label(backend)}. Saved per backend.",
+            wraplength=380,
+        ).pack(anchor="w", pady=(0, 12))
+
+        fields = [
+            ("temperature", "Temperature", "Higher = more varied output"),
+            ("top_p", "Top P", "Nucleus sampling cutoff"),
+            ("top_k", "Top K", "Candidate-token cutoff (integer)"),
+            ("repetition_penalty", "Repetition Penalty", "> 1.0 discourages verbatim repeats"),
+            ("max_tokens", "Max Tokens", "Response length cap (integer)"),
+        ]
+        entry_vars = {}
+        for key, label_text, hint in fields:
+            row = ttk.Frame(container)
+            row.pack(fill="x", pady=4)
+            label_col = ttk.Frame(row)
+            label_col.pack(side="left", fill="x", expand=True)
+            ttk.Label(label_col, text=label_text).pack(anchor="w")
+            ttk.Label(label_col, text=hint, foreground="#888888", font=("Helvetica", 9)).pack(anchor="w")
+            var = tk.StringVar(value=str(settings[key]))
+            entry_vars[key] = var
+            ttk.Entry(row, textvariable=var, width=10, justify="right").pack(side="right")
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(container, textvariable=status_var, foreground="#c0392b").pack(anchor="w", pady=(6, 0))
+
+        def parse_and_clamp(key, raw):
+            is_int = key in ("top_k", "max_tokens")
+            value = int(raw) if is_int else float(raw)
+            return clamp_model_setting(key, value)
+
+        def do_save():
+            updated = dict(settings)
+            for key, var in entry_vars.items():
+                try:
+                    updated[key] = parse_and_clamp(key, var.get().strip())
+                except ValueError:
+                    status_var.set(f"Invalid value for {key}: {var.get()!r}")
+                    return
+            save_model_settings(backend, updated)
+            for key, var in entry_vars.items():
+                var.set(str(updated[key]))
+            status_var.set(f"Saved. Bounds: {', '.join(f'{k} {MODEL_SETTING_BOUNDS[k][0]}..{MODEL_SETTING_BOUNDS[k][1]}' for k in ('temperature', 'top_p', 'top_k'))}")
+
+        def do_reset():
+            for key, var in entry_vars.items():
+                var.set(str(MODEL_SETTING_DEFAULTS[key]))
+            save_model_settings(backend, dict(MODEL_SETTING_DEFAULTS))
+            status_var.set("Reset to defaults and saved.")
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill="x", pady=(14, 0))
+        ttk.Button(buttons, text="Reset to Defaults", command=do_reset).pack(side="left")
+        ttk.Button(buttons, text="Save", command=do_save).pack(side="right")
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="right", padx=(0, 8))
+
+    def build_menu(self):
+        menu = tk.Menu(self)
+        file_menu = tk.Menu(menu, tearoff=False)
+        file_menu.add_command(label="Import Files...", command=self.import_files)
+        file_menu.add_separator()
+        file_menu.add_command(label="New Chat", command=self.new_chat)
+        file_menu.add_command(label="Clear Chat", command=self.clear_chat)
+        file_menu.add_separator()
+        file_menu.add_command(label="Save Dialogue Context...", command=self.save_dialogue_context)
+        file_menu.add_command(label="Load Dialogue Context...", command=self.load_dialogue_context)
+        file_menu.add_separator()
+        file_menu.add_command(label="Export Latest Reply...", command=self.export_reply)
+        file_menu.add_command(label="Save Latest Reply as DOCX", command=self.save_latest_docx)
+        file_menu.add_separator()
+        file_menu.add_command(label="Quit", command=self.quit_app)
+        menu.add_cascade(label="File", menu=file_menu)
+        edit = tk.Menu(menu, tearoff=False)
+        edit.add_command(label="Copy", accelerator="Cmd+C", command=self.menu_copy)
+        edit.add_command(label="Paste", accelerator="Cmd+V", command=self.menu_paste)
+        edit.add_command(label="Select All", accelerator="Cmd+A", command=self.menu_select_all)
+        edit.add_command(label="Copy Latest Reply", command=self.copy_latest_reply)
+        edit.add_separator()
+        edit.add_command(label="Clear Chat", command=self.clear_chat)
+        menu.add_cascade(label="Edit", menu=edit)
+        tools_menu = tk.Menu(menu, tearoff=False)
+        tools_menu.add_command(label="Refine Prompt...", command=self.refine_prompt)
+        tools_menu.add_command(label="Add File Reference...", command=self.insert_file_references)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Check for Repo Updates (Qwen fork)", command=self.check_repo_updates_menu)
+        menu.add_cascade(label="Tools", menu=tools_menu)
+        view = tk.Menu(menu, tearoff=False)
+        view.add_command(label="Resources...", command=self.open_resources)
+        view.add_command(label="System Stats...", command=self.open_system_stats)
+        view.add_command(label="Model Settings...", command=self.open_model_settings)
+        menu.add_cascade(label="View", menu=view)
+        backend_menu = tk.Menu(menu, tearoff=False)
+        for backend in SUPPORTED_BACKENDS:
+            backend_menu.add_command(
+                label=f"{backend_label(backend)} - {backend_description(backend)}",
+                command=lambda name=backend: self.switch_backend(name),
+            )
+        menu.add_cascade(label="Backend", menu=backend_menu)
+        defaults = tk.Menu(menu, tearoff=False)
+        defaults.add_command(label="Settings...", command=self.open_settings)
+        defaults.add_command(label="Restore Built-in Dialogue Defaults", command=self.restore_builtin_dialogue_defaults)
+        menu.add_cascade(label="Defaults", menu=defaults)
+        self.config(menu=menu)
+        self.bind_all("<Command-c>", lambda _event: self.menu_copy())
+        self.bind_all("<Command-C>", lambda _event: self.menu_copy())
+        self.bind_all("<Control-c>", lambda _event: self.menu_copy())
+        self.bind_all("<Control-C>", lambda _event: self.menu_copy())
+        self.bind_all("<Command-a>", lambda _event: self.menu_select_all())
+        self.bind_all("<Command-A>", lambda _event: self.menu_select_all())
+        self.bind_all("<Control-a>", lambda _event: self.menu_select_all())
+        self.bind_all("<Control-A>", lambda _event: self.menu_select_all())
+        self.bind_all("<Escape>", self.handle_escape)
+        self.text_menu = tk.Menu(self, tearoff=False)
+        self.text_menu.add_command(label="Copy", command=self.context_copy)
+        self.text_menu.add_command(label="Paste", command=self.context_paste)
+        self.text_menu.add_command(label="Select All", command=self.context_select_all)
+
+    def bind_text_context_menu(self, widget):
+        widget.bind("<Button-2>", self.show_text_context_menu)
+        widget.bind("<Button-3>", self.show_text_context_menu)
+        widget.bind("<Control-Button-1>", self.show_text_context_menu)
+
+    def show_text_context_menu(self, event):
+        self.context_widget = event.widget
+        event.widget.focus_set()
+        try:
+            self.text_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.text_menu.grab_release()
+        return "break"
+
+    def active_text_widget(self):
+        widget = self.context_widget or self.focused_text_widget()
+        return widget if isinstance(widget, tk.Text) else None
+
+    def context_copy(self):
+        widget = self.active_text_widget()
+        if widget is self.input:
+            return self.copy_input_selection()
+        return self.copy_chat_selection()
+
+    def context_paste(self):
+        widget = self.active_text_widget()
+        if widget is self.input:
+            return self.paste_into_input()
+        self.input.focus_set()
+        return self.paste_into_input()
+
+    def context_select_all(self):
+        widget = self.active_text_widget()
+        if widget is self.input:
+            return self.select_all_input()
+        return self.select_all_chat()
+
+    def focused_text_widget(self):
+        widget = self.focus_get()
+        return widget if isinstance(widget, tk.Text) else None
+
+    def menu_copy(self):
+        widget = self.focused_text_widget()
+        if widget is self.chat:
+            return self.copy_chat_selection()
+        if widget is self.input:
+            return self.copy_input_selection()
+        return self.copy_chat_selection()
+
+    def menu_paste(self):
+        widget = self.focused_text_widget()
+        if widget is self.input:
+            return self.paste_into_input()
+        self.input.focus_set()
+        return self.paste_into_input()
+
+    def menu_select_all(self):
+        widget = self.focused_text_widget()
+        if widget is self.input:
+            return self.select_all_input()
+        return self.select_all_chat()
+
+    def status(self, text):
+        self.events.put(("status", text))
+
+    def raise_text_selection(self):
+        try:
+            self.chat.tag_raise("sel")
+            self.input.tag_raise("sel")
+        except Exception:
+            pass
+        return None
+
+    def start_working(self, text="Thinking"):
+        self.working_started_at = time.time()
+        self.update_working_elapsed()
+        self.status_var.set(text)
+
+    def stop_working(self):
+        if self.working_after is not None:
+            self.after_cancel(self.working_after)
+            self.working_after = None
+        self.working_started_at = None
+        self.working_var.set("")
+
+    def update_working_elapsed(self):
+        if not self.busy or self.working_started_at is None:
+            self.working_var.set("")
+            self.working_after = None
+            return
+        elapsed = int(time.time() - self.working_started_at)
+        self.working_var.set(f"Working {elapsed}s")
+        self.working_after = self.after(1000, self.update_working_elapsed)
+
+    # The small status-bar text and elapsed counter above are easy to miss
+    # since a user's attention during a turn is naturally on the chat pane --
+    # and once a model turn involves any tool call (effectively always, since
+    # tools are offered on every turn now), streamed text is buffered and
+    # nothing appears there at all until the whole turn finishes, which reads
+    # as a stall even when a slow ssh_run or shell command is actively
+    # running. This puts a live, animating placeholder directly in the chat
+    # pane, right where the eye already is, updated in place as tool status
+    # changes and cleared the moment real content is ready to display.
+    _INDICATOR_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+    def show_working_indicator(self, label):
+        self.indicator_label = label
+        if self.indicator_active:
+            return
+        self.indicator_active = True
+        self.indicator_start_index = self.chat.index("end-1c")
+        self.indicator_frame = 0
+        self._render_working_indicator()
+
+    def _render_working_indicator(self):
+        if not self.indicator_active or self.indicator_start_index is None:
+            self.indicator_after = None
+            return
+        frame = self._INDICATOR_FRAMES[self.indicator_frame % len(self._INDICATOR_FRAMES)]
+        self.indicator_frame += 1
+        elapsed = int(time.time() - self.working_started_at) if self.working_started_at else 0
+        self.chat.delete(self.indicator_start_index, "end-1c")
+        self.chat.insert(self.indicator_start_index, f"{frame} {self.indicator_label}... ({elapsed}s)",
+                          "working_indicator")
+        if not self.chat.tag_ranges("sel"):
+            self.chat.see("end")
+        self.indicator_after = self.after(150, self._render_working_indicator)
+
+    def hide_working_indicator(self):
+        if not self.indicator_active:
+            return
+        self.indicator_active = False
+        if self.indicator_after is not None:
+            self.after_cancel(self.indicator_after)
+            self.indicator_after = None
+        if self.indicator_start_index is not None:
+            self.chat.delete(self.indicator_start_index, "end-1c")
+            self.indicator_start_index = None
+
+    def quit_app(self):
+        self.stop_working()
+        self.stop_resource_refresh()
+        self.destroy()
+        return "break"
+
+    def apply_system_prompt(self, text):
+        self.system_prompt = text.strip() or DEFAULT_SYSTEM
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = self.system_prompt
+        else:
+            self.messages.insert(0, {"role": "system", "content": self.system_prompt})
+
+    def open_dialogue_options(self):
+        return self.open_settings()
+
+    def refine_prompt(self, request_text=None):
+        if self.busy or getattr(self, "refining", False):
+            return
+        raw_request = (request_text if request_text is not None else self.input.get("1.0", "end-1c")).strip()
+        if not raw_request:
+            raw_request = self.last_user_text.strip()
+        if not raw_request:
+            messagebox.showinfo(
+                "Refine Prompt",
+                "Enter a request in the prompt box first, or refine after sending a request.",
+                parent=self,
+            )
+            return
+        model = self.selected_model_id()
+        if not model:
+            messagebox.showinfo("No model", "Wait for models to load first.", parent=self)
+            return
+        self.refining = True
+        self.refine_button.configure(state="disabled")
+        self.status_var.set("Refining prompt")
+        self.start_working("Refining")
+        threading.Thread(
+            target=self.refine_prompt_worker,
+            args=(model, raw_request, compact_refinement_context(self.messages)),
+            daemon=True,
+        ).start()
+
+    def refine_prompt_worker(self, model, raw_request, context):
+        try:
+            refined, usage = refine_prompt_once(self.url, self.key, model, raw_request, context)
+            self.events.put(("refined", raw_request, refined, usage))
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                detail = ""
+            message = f"HTTP {exc.code}: {exc.reason}"
+            if detail:
+                message += f" - {detail[:400]}"
+            log_error("refine_prompt", f"(backend={self.backend}, model={model}) {message}")
+            self.events.put(("refine_error", message))
+        except Exception as exc:
+            log_error("refine_prompt", f"{type(exc).__name__} (backend={self.backend}, model={model}): {exc}")
+            self.events.put(("refine_error", str(exc)))
+
+    def open_settings(self):
+        win = tk.Toplevel(self)
+        win.title("Settings")
+        win.geometry("760x540")
+        win.transient(self)
+
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        notebook = ttk.Notebook(frame)
+        notebook.pack(fill="both", expand=True)
+
+        defaults_tab = ttk.Frame(notebook, padding=10)
+        chat_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(defaults_tab, text="Defaults")
+        notebook.add(chat_tab, text="This Chat")
+
+        ttk.Label(defaults_tab, text="Saved defaults used when mlxgui starts or chat is cleared").pack(anchor="w")
+        preset_row = ttk.Frame(defaults_tab)
+        preset_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(preset_row, text="Preset").pack(side="left")
+        preset_var = tk.StringVar(value="Concise, Efficient Agent Conversation")
+        ttk.OptionMenu(
+            preset_row,
+            preset_var,
+            preset_var.get(),
+            *PRESET_SYSTEMS.keys(),
+        ).pack(side="left", padx=(8, 8))
+
+        default_convert_var = tk.StringVar(value=self.convert_var.get())
+        ttk.Label(preset_row, text="Import conversion").pack(side="left", padx=(16, 0))
+        ttk.OptionMenu(
+            preset_row,
+            default_convert_var,
+            default_convert_var.get(),
+            *CONVERT_MODES,
+        ).pack(side="left", padx=(8, 0))
+
+        text = tk.Text(defaults_tab, wrap="word", height=16, padx=8, pady=8)
+        text.pack(fill="both", expand=True, pady=(8, 10))
+        text.insert("1.0", self.system_prompt)
+
+        buttons = ttk.Frame(defaults_tab)
+        buttons.pack(fill="x")
+
+        ttk.Label(chat_tab, text="Settings that apply only to the current dialogue").pack(anchor="w")
+        rag_row = ttk.Frame(chat_tab)
+        rag_row.pack(fill="x", pady=(12, 6))
+        ttk.Label(rag_row, text="RAG folder").pack(side="left")
+        rag_entry = ttk.Entry(rag_row, textvariable=self.chat_rag_folder_var)
+        rag_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+
+        def browse_rag_folder():
+            folder = filedialog.askdirectory(title="Select RAG folder", initialdir=str(load_default_dir()))
+            if folder:
+                self.chat_rag_folder_var.set(folder)
+                self.status_var.set(f"Set chat RAG folder to {folder}")
+
+        def clear_rag_folder():
+            self.chat_rag_folder_var.set("")
+            self.status_var.set("Cleared chat RAG folder")
+
+        ttk.Button(rag_row, text="Browse", command=browse_rag_folder).pack(side="left")
+        ttk.Button(rag_row, text="Clear", command=clear_rag_folder).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            chat_tab,
+            text=(
+                "The RAG folder is intentionally chat-specific. It is not saved as a global default, "
+                "so unrelated chats do not automatically reference the same documents."
+            ),
+            wraplength=680,
+        ).pack(anchor="w", pady=(4, 12))
+        ttk.Label(
+            chat_tab,
+            text=(
+                "Original files stay in their original format. mlxgui builds and reuses a hidden "
+                "Markdown cache for retrieval in .mlxgui_rag_cache inside the selected RAG folder."
+            ),
+            wraplength=680,
+        ).pack(anchor="w", pady=(0, 10))
+        rag_actions = ttk.Frame(chat_tab)
+        rag_actions.pack(fill="x", pady=(0, 12))
+        ttk.Button(rag_actions, text="Rebuild RAG Cache", command=self.rebuild_rag_cache).pack(side="left")
+        ttk.Button(rag_actions, text="Clear RAG Cache", command=self.clear_rag_cache).pack(side="left", padx=(8, 0))
+        ttk.Button(chat_tab, text="Open Resources", command=self.open_resources).pack(anchor="w")
+
+        def save_current():
+            content = text.get("1.0", "end-1c").strip()
+            if not content:
+                messagebox.showinfo("Dialogue Options", "Instructions cannot be empty.")
+                return
+            try:
+                save_system_prompt(content)
+            except Exception as exc:
+                messagebox.showerror("Save failed", str(exc))
+                return
+            mode = default_convert_var.get()
+            if mode not in CONVERT_MODES:
+                messagebox.showinfo("Settings", "Choose a valid import conversion mode.")
+                return
+            self.gui_defaults["convert_mode"] = mode
+            try:
+                save_gui_defaults(self.gui_defaults)
+            except Exception as exc:
+                messagebox.showerror("Save failed", str(exc))
+                return
+            self.apply_system_prompt(content)
+            self.convert_var.set(mode)
+            self.status_var.set("Saved default settings")
+            win.destroy()
+
+        def restore_text():
+            text.delete("1.0", "end")
+            text.insert("1.0", DEFAULT_SYSTEM)
+
+        def apply_preset():
+            text.delete("1.0", "end")
+            text.insert("1.0", PRESET_SYSTEMS[preset_var.get()])
+
+        ttk.Button(buttons, text="Save Default", command=save_current).pack(side="right")
+        ttk.Button(buttons, text="Restore Built-in", command=restore_text).pack(side="right", padx=(0, 8))
+        ttk.Button(buttons, text="Apply Preset", command=apply_preset).pack(side="right", padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=(0, 8))
+        text.focus_set()
+
+    def restore_builtin_dialogue_defaults(self):
+        try:
+            save_system_prompt(DEFAULT_SYSTEM)
+        except Exception as exc:
+            messagebox.showerror("Restore failed", str(exc))
+            return
+        self.apply_system_prompt(DEFAULT_SYSTEM)
+        self.status_var.set("Restored built-in dialogue defaults")
+
+    def rebuild_rag_cache(self):
+        folder = (self.chat_rag_folder_var.get() or "").strip()
+        if not folder:
+            messagebox.showinfo("RAG cache", "Set a chat RAG folder first.")
+            return
+        try:
+            cache_dir = rag_cache_dir(folder)
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            context = rag_context_for_query(folder, "rebuild rag cache")
+        except Exception as exc:
+            messagebox.showerror("RAG cache", str(exc))
+            return
+        self.status_var.set(
+            f"Rebuilt RAG cache: {context['indexed_count']} file(s) indexed at {context['cache_dir']}"
+        )
+
+    def clear_rag_cache(self):
+        folder = (self.chat_rag_folder_var.get() or "").strip()
+        if not folder:
+            messagebox.showinfo("RAG cache", "Set a chat RAG folder first.")
+            return
+        cache_dir = rag_cache_dir(folder)
+        try:
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+        except Exception as exc:
+            messagebox.showerror("RAG cache", str(exc))
+            return
+        self.status_var.set(f"Cleared RAG cache at {cache_dir}")
+
+    def open_resources(self):
+        win = tk.Toplevel(self)
+        win.title("Resources")
+        win.geometry("620x520")
+        win.transient(self)
+
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Local session and Mac resource snapshot").pack(anchor="w")
+        text = tk.Text(frame, wrap="word", padx=8, pady=8, height=20)
+        text.pack(fill="both", expand=True, pady=(8, 10))
+        text.insert("1.0", self.resource_report())
+        text.configure(state="disabled")
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+
+        def refresh():
+            self.update_memory_indicator()
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", self.resource_report())
+            text.configure(state="disabled")
+
+        ttk.Button(buttons, text="Clear Conversation", command=self.clear_chat).pack(side="left")
+        ttk.Button(buttons, text="Refresh", command=refresh).pack(side="right")
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="right", padx=(0, 8))
+
+    def resource_report(self):
+        lines = [
+            "Dialogue",
+            f"- User turns in context: {self.user_turn_count()} of {MAX_HISTORY_TURNS}",
+            f"- Last turn tokens: in {self.last_turn_tokens['in']:,} / out {self.last_turn_tokens['out']:,}",
+            f"- Session tokens: in {self.totals['in']:,} / out {self.totals['out']:,}",
+            f"- Imported file cap: {MAX_FILE_CHARS:,} characters per file",
+            f"- RAG folder: {self.chat_rag_folder_var.get() or '(none set for this chat)'}",
+            f"- RAG mode: keep original files, retrieve from cached markdown",
+            "",
+            "Guidance",
+            self.resource_guidance(),
+            "",
+            "Recommendations",
+            *self.resource_recommendations(),
+            "",
+            "Mac Memory",
+        ]
+        lines.extend(system_resource_lines())
+        return "\n".join(lines)
+
+    def user_turn_count(self):
+        return sum(1 for message in self.messages if message.get("role") == "user")
+
+    def resource_guidance(self):
+        last_in = self.last_turn_tokens["in"]
+        turns = self.user_turn_count()
+        if last_in >= 12000:
+            return "- Clear or start a new dialogue soon. Input context is already large."
+        if last_in >= 8000:
+            return "- Consider Clear after this task. Input context is approaching a heavy local-model turn."
+        if turns >= MAX_HISTORY_TURNS:
+            return "- Conversation is at the retained-turn limit; older turns are being trimmed automatically."
+        if turns >= MAX_HISTORY_TURNS - 3:
+            return "- Several turns are in context. Clear when the current topic is done."
+        return "- Resource use looks reasonable for the current dialogue."
+
+    def resource_recommendations(self):
+        last_in = self.last_turn_tokens["in"]
+        turns = self.user_turn_count()
+        recommendations = []
+        if last_in >= 12000:
+            recommendations.append("- Clear now unless the next question needs this full dialogue.")
+            recommendations.append("- Save or export anything important before clearing.")
+        elif last_in >= 8000:
+            recommendations.append("- Finish the current task, then clear before changing topics.")
+            recommendations.append("- Import fewer or smaller files, or ask for a summary first.")
+        elif turns >= MAX_HISTORY_TURNS - 3:
+            recommendations.append("- Clear when this topic is done; older turns will soon be trimmed.")
+        else:
+            recommendations.append("- Continue normally.")
+        recommendations.append("- Start a new dialogue for unrelated work.")
+        recommendations.append("- Use concise dialogue defaults for code or document tasks.")
+        return recommendations
+
+    def resource_status_text(self):
+        last_in = self.last_turn_tokens["in"]
+        turns = self.user_turn_count()
+        if last_in >= 12000:
+            return "Context: Clear Soon"
+        if last_in >= 8000 or turns >= MAX_HISTORY_TURNS - 3:
+            return "Context: Growing"
+        return "Context: OK"
+
+    def update_resource_indicator(self):
+        self.resource_var.set(self.resource_status_text())
+
+    def update_memory_indicator(self):
+        snapshot = system_resource_snapshot()
+        total = snapshot["total"]
+        reclaimable = snapshot["reclaimable"]
+        if not total or reclaimable is None:
+            self.memory_var.set("Resources: unavailable")
+            return
+        used = max(total - reclaimable, 0)
+        used_pct = used / total * 100
+        self.memory_var.set(
+            f"Resources: memory {used_pct:.0f}% used / {reclaimable / 2**30:.1f} GB avail"
+        )
+
+    def start_resource_refresh(self):
+        if self.resource_after is None:
+            self.resource_after = self.after(RESOURCE_REFRESH_MS, self.refresh_resources_live)
+
+    def stop_resource_refresh(self):
+        if self.resource_after is not None:
+            self.after_cancel(self.resource_after)
+            self.resource_after = None
+
+    def refresh_resources_live(self):
+        self.resource_after = None
+        self.update_memory_indicator()
+        self.check_server_status_async()
+        self.start_resource_refresh()
+
+    def check_server_status_async(self):
+        url, key = self.url, self.key
+
+        def worker():
+            reachable = False
+            try:
+                with urllib.request.urlopen(request(url, key, "/v1/models"), timeout=3):
+                    reachable = True
+            except Exception:
+                reachable = False
+            self.events.put(("server_status", reachable))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def handle_escape(self, _event=None):
+        if self.busy:
+            self.cancel_current_response()
+        else:
+            self.status_var.set("Nothing running")
+        return "break"
+
+    def cancel_current_response(self):
+        self.cancel_requested = True
+        self.status_var.set("Stopping current response...")
+        self.working_var.set("Stopping")
+        self.send_button.configure(state="normal")
+
+    def request_tool_approval(self, description):
+        event = threading.Event()
+        result = {"approved": False, "cancelled": False}
+        self.events.put(("approval", description, event, result))
+        while not event.wait(0.1):
+            if self.cancel_requested:
+                result["cancelled"] = True
+                return False
+        return result["approved"]
+
+    def execute_tool(self, name, args):
+        name = str(name or "").strip().lower().replace(".", ":").replace("/", ":").rsplit(":", 1)[-1]
+        if name == "run_command":
+            command = args.get("command", "")
+            try:
+                mkdir_parts = shlex.split(command)
+            except ValueError:
+                mkdir_parts = []
+            if mkdir_parts[:2] == ["mkdir", "-p"] and len(mkdir_parts) > 2:
+                root = load_default_dir().resolve()
+                targets = [pathlib.Path(part).expanduser().resolve(strict=False) for part in mkdir_parts[2:]]
+                if all(target.is_relative_to(root) for target in targets) and all(target.exists() for target in targets):
+                    return "exit_code=0\n(no action; requested directories already exist)"
+            if not self.request_tool_approval(f"Run command:\n{command}"):
+                return "User declined."
+            try:
+                cwd = gui_infer_command_cwd(command)
+                proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=180, cwd=cwd)
+                output = (proc.stdout + proc.stderr).strip()[:MAX_FILE_CHARS]
+                location = f"\nworking_directory={cwd}" if cwd else ""
+                return f"exit_code={proc.returncode}{location}\n{output or '(no output)'}"
+            except subprocess.TimeoutExpired:
+                return "Command timed out."
+        if name == "python_interpreter":
+            code = args.get("code", "")
+            if any(term in code for term in ("open(", "write_text(", "makedirs(", "mkdir(", "os.remove(", "unlink(")):
+                return "Error: use write_file for file creation and run_command for execution; python_interpreter is disabled for filesystem writes."
+            if not self.request_tool_approval(f"Run Python code ({len(code)} chars)"):
+                return "User declined."
+            try:
+                proc = subprocess.run(["python3", "-c", code], capture_output=True, text=True, timeout=180)
+                output = (proc.stdout + proc.stderr).strip()[:MAX_FILE_CHARS]
+                return f"exit_code={proc.returncode}\n{output or '(no output)'}"
+            except subprocess.TimeoutExpired:
+                return "Python execution timed out."
+        if name == "read_file":
+            path = pathlib.Path(args.get("path", "")).expanduser()
+            if path.is_dir():
+                return (f"Error: {path} is a directory, not a file. "
+                        f"Use run_command with 'ls' or 'find' to see its contents.")
+            try:
+                text = path.read_text(errors="replace")
+                return text[:MAX_FILE_CHARS] + ("\n[truncated]" if len(text) > MAX_FILE_CHARS else "")
+            except Exception as exc:
+                return f"Error: {exc}"
+        if name == "write_file":
+            raw_path = args.get("path", "")
+            content = args.get("content", args.get("text", ""))
+            target = resolve_output_path(raw_path)
+            old = ""
+            if target.exists():
+                try:
+                    old = target.read_text(errors="replace")
+                except Exception:
+                    old = ""
+                if target.suffix == ".py" and "zcta" in old.lower() and re.search(r"\bzzcta\b", content, re.IGNORECASE):
+                    return "Error: rejected suspicious overwrite; proposed Python content changes zcta to zzcta in an existing validated script. Inspect and preserve the existing file."
+            # Existing-file overwrites are gated by the approval dialog below (which
+            # shows a diff), not by guessing intent from the request's wording — that
+            # keyword-based pre-check silently blocked legitimate requests before.
+            preview = f"Write {len(content)} chars to:\n{target}"
+            if old and old != content:
+                diff_lines = list(difflib.unified_diff(
+                    old.splitlines(), content.splitlines(),
+                    fromfile="current", tofile="proposed", lineterm=""))[:40]
+                if diff_lines:
+                    preview += "\n\n" + "\n".join(diff_lines)
+            if not self.request_tool_approval(preview):
+                return "User declined."
+            backup_path = backup_before_overwrite(target) if (old and old != content) else None
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+                record_last_artifact(target, self.last_user_text)
+                note = f" (previous version backed up to {backup_path})" if backup_path else ""
+                result = f"Written: {target} ({target.stat().st_size} bytes).{note}"
+                if target.suffix == ".py":
+                    syntax_error = python_syntax_error(content)
+                    if syntax_error:
+                        return (f"{result} Error: this file has a Python syntax error and will not run "
+                                f"({syntax_error}) — likely truncated mid-generation. Rewrite it completely with write_file.")
+                    missing = missing_local_imports(target)
+                    if missing:
+                        plural = "s" if len(missing) > 1 else ""
+                        return (f"{result} Warning: this file imports {', '.join(missing)}, which "
+                                f"{'are' if plural else 'is'} neither a standard-library module nor installed, and "
+                                f"{'have' if plural else 'has'} no matching file yet in {target.parent}. "
+                                "If it's meant to be a local module, write it now with write_file. If it's a "
+                                "third-party package, install it first with run_command (pip install ...) or state "
+                                "that it's a required dependency — do not report completion either way until resolved.")
+                return result
+            except Exception as exc:
+                return f"Error: {exc}"
+        if name == "ha_api":
+            target = str(args.get("host") or args.get("target") or "").strip().lower()
+            method = str(args.get("method") or "GET").upper()
+            api_path = args.get("path", "") or ("/api/states" if (args.get("domain") or args.get("state")) else "")
+            import mlxlib as _ml0
+            api_path, args = _ml0.ha_split_states_query(api_path, args)
+            data = args.get("data")
+            entry = load_host_aliases().get(target)
+            ha_cfg = None
+            if entry:
+                if entry.get("type") == "ha_api":
+                    ha_cfg = entry
+                elif entry.get("ha_api"):
+                    ha_cfg = entry["ha_api"]
+            if not ha_cfg:
+                return f"Error: '{target}' is not a known ha_api-capable alias."
+            token = keychain_get(target, ha_cfg.get("keychain_service", ""))
+            if token is None:
+                return f"Error: no stored HA token for alias '{target}'."
+            if not self.request_tool_approval(f"Home Assistant API call:\n{target} {method} {api_path}"):
+                return "User declined."
+            try:
+                base_url = ha_cfg["base_url"]
+                if method == "GET":
+                    result = ha_http_api(base_url, token, api_path)
+                else:
+                    req = ha_http_request(base_url, token, api_path, payload=data if data is not None else {})
+                    req.get_method = lambda: method
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        result = json.load(r)
+                import mlxlib as _ml
+                view = _ml.ha_states_view(method, api_path, result, args, target)
+                if view is not None:
+                    return view
+                text = json.dumps(result, indent=2)
+                note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
+                return f"[source: {target}]\n" + text[:MAX_FILE_CHARS] + note
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:800]
+                return f"HTTP {exc.code} from {target}: {detail}"
+            except Exception as exc:
+                return f"Error calling ha_api on {target}: {exc}"
+        if name == "web_search":
+            query = args.get("query", "")
+            max_results = args.get("max_results", 5)
+            if not str(query).strip():
+                return "Error: web_search needs a non-empty 'query'."
+            # Every tool call in this GUI already goes through
+            # request_tool_approval with no "always allow" shortcut, so this
+            # already never runs without the user seeing and confirming it
+            # first -- unlike every other tool here, this one leaves the
+            # user's own machines/services and reaches the open internet.
+            if not self.request_tool_approval(f"Web search:\n{query}\n(up to {max_results} results)"):
+                return "User declined."
+            try:
+                results = web_search(query, max_results=max_results)
+            except Exception as exc:
+                return f"Error running web_search: {exc}"
+            if not results:
+                return f"[web_search: {query!r}] No results."
+            lines = [f"[web_search: {query!r}] {len(results)} result(s):"]
+            for i, r in enumerate(results, 1):
+                lines.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}")
+            return "\n".join(lines)[:MAX_FILE_CHARS]
+        if name in ("ssh_run", "ssh_read", "ssh_write"):
+            # This GUI has no SSH implementation at all (unlike mlxcli's
+            # terminal REPL, which fully supports these) -- rather than a
+            # bare "Unknown tool" that reads like a wiring bug, tell the
+            # model plainly so it relays the right next step to the user
+            # instead of retrying variations or claiming it tried.
+            return (f"'{name}' is not available in this GUI. Remote SSH access to a server "
+                    f"or device isn't implemented here — tell the user to run this request in "
+                    f"mlxcli (the terminal version) instead, which fully supports {name} and "
+                    f"saved host aliases. Do not attempt a workaround or retry with a different tool.")
+        plugin = plugin_tools().get(name)
+        if plugin:
+            if plugin["requires_approval"] and not self.request_tool_approval(f"{name}:\n{args}"):
+                return "User declined."
+            try:
+                return plugin["run"](args)
+            except Exception as exc:
+                return f"Error running plugin tool '{name}': {exc}"
+        return f"Unknown tool: {name}"
+
+    def finish_canceled_response(self, partial_text):
+        self.hide_working_indicator()
+        if self.current_stream_start and self.current_stream_end and partial_text:
+            self.style_assistant_range(self.current_stream_start, self.current_stream_end)
+        if self.pending_user_index is not None and self.pending_user_index < len(self.messages):
+            pending = self.messages[self.pending_user_index]
+            if pending.get("role") == "user" and pending.get("content") == self.last_user_text:
+                del self.messages[self.pending_user_index]
+        self.pending_user_index = None
+        self.cancel_requested = False
+        self.busy = False
+        self.stop_working()
+        self.send_button.configure(state="normal")
+        self.current_stream_start = None
+        self.current_stream_end = None
+        self.append_tagged("\n[stopped - partial reply not kept in context]\n", "meta")
+        self.update_resource_indicator()
+        self.status_var.set("Stopped")
+
+    def append(self, text):
+        self.chat.insert("end", text)
+        if not self.chat.tag_ranges("sel"):
+            self.chat.see("end")
+
+    def append_tagged(self, text, tag):
+        self.chat.insert("end", text, tag)
+        if not self.chat.tag_ranges("sel"):
+            self.chat.see("end")
+
+    def append_model_text(self, text):
+        start = self.chat.index("end-1c")
+        self.chat.insert("end", text, "assistant_body")
+        end = self.chat.index("end-1c")
+        self.current_stream_end = end
+        if not self.chat.tag_ranges("sel"):
+            self.chat.see("end")
+
+    def style_assistant_range(self, start, end):
+        self.apply_markdown_line_tags(start, end)
+        self.apply_inline_code_tag(start, end)
+        self.raise_text_selection()
+
+    def apply_markdown_line_tags(self, start, end):
+        text = self.chat.get(start, end)
+        offset = 0
+        in_fence = False
+        for line in text.splitlines(True):
+            stripped = line.strip()
+            line_start = f"{start}+{offset}c"
+            line_end = f"{start}+{offset + len(line)}c"
+            if stripped.startswith("```"):
+                self.chat.tag_add("code_block", line_start, line_end)
+                in_fence = not in_fence
+            elif in_fence:
+                self.chat.tag_add("code_block", line_start, line_end)
+            elif stripped.startswith("# "):
+                self.chat.tag_add("heading", line_start, line_end)
+            elif stripped.startswith(("## ", "### ")):
+                self.chat.tag_add("subheading", line_start, line_end)
+            elif stripped.startswith(("- ", "* ")) or (len(stripped) > 3 and stripped[0].isdigit() and stripped[1:3] in (". ", ") ")):
+                self.chat.tag_add("bullet", line_start, line_end)
+            offset += len(line)
+
+    def apply_inline_code_tag(self, start, end):
+        text = self.chat.get(start, end)
+        offset = 0
+        while True:
+            left = text.find("`", offset)
+            if left < 0:
+                break
+            right = text.find("`", left + 1)
+            if right < 0:
+                break
+            self.chat.tag_add("code", f"{start}+{left}c", f"{start}+{right + 1}c")
+            offset = right + 1
+
+    def copy_text(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_var.set(f"Copied {len(text)} chars")
+
+    def select_all_input(self, _event=None):
+        self.input.focus_set()
+        self.input.tag_remove("sel", "1.0", "end")
+        self.input.tag_add("sel", "1.0", "end-1c")
+        self.input.mark_set("insert", "end-1c")
+        self.raise_text_selection()
+        self.status_var.set("Selected all input text")
+        return "break"
+
+    def copy_input_selection(self, _event=None):
+        try:
+            selected = self.input.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = ""
+        if not selected:
+            self.status_var.set("No input text selected")
+            return "break"
+        self.clipboard_clear()
+        self.clipboard_append(selected)
+        self.status_var.set("Copied selected input text")
+        return "break"
+
+    def select_all_chat(self, _event=None):
+        self.chat.focus_set()
+        self.chat.tag_remove("sel", "1.0", "end")
+        self.chat.tag_add("sel", "1.0", "end-1c")
+        self.chat.mark_set("insert", "end-1c")
+        self.raise_text_selection()
+        self.status_var.set("Selected all chat text")
+        return "break"
+
+    def copy_chat_selection(self, _event=None):
+        try:
+            selected = self.chat.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = ""
+        if not selected:
+            self.status_var.set("No chat text selected")
+            return "break"
+        self.clipboard_clear()
+        self.clipboard_append(selected)
+        self.status_var.set("Copied selected chat text")
+        return "break"
+
+    def latest_reply_text(self):
+        for message in reversed(self.messages):
+            if message.get("role") == "assistant" and message.get("content"):
+                return message["content"]
+        return ""
+
+    def copy_latest_reply(self):
+        content = self.latest_reply_text()
+        if not content:
+            self.status_var.set("No model reply to copy")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        self.status_var.set("Copied latest reply")
+        return "break"
+
+    def autosave_docx_requested(self):
+        text = self.last_user_text.lower()
+        wants_doc = any(term in text for term in ("word document", "docx", ".docx", "export as word", "save as word"))
+        wants_save = any(term in text for term in ("save", "export", "create", "make", "generate"))
+        return wants_doc and wants_save
+
+    def default_docx_path(self):
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        text = self.last_user_text.lower()
+        if "omlx" in text and ("mlxgui" in text or "mlxcli" in text):
+            name = "omlx-mlxcli-mlxgui-setup"
+        else:
+            name = "mlxgui-reply"
+        return load_default_dir() / f"{name}-{stamp}.docx"
+
+    def save_docx_content(self, content, target=None):
+        target = pathlib.Path(target or self.default_docx_path()).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        markdown_to_docx(target, "mlxgui Export", content)
+        self.status_var.set(f"Saved {target.name}")
+        self.append(f"\n[saved Word document to {target}]\n")
+        return target
+
+    def save_latest_docx(self):
+        content = self.latest_reply_text()
+        if not content:
+            messagebox.showinfo("No reply", "There is no model reply to save yet.")
+            return
+        try:
+            self.save_docx_content(content)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+
+    def paste_into_input(self, _event=None):
+        self.input.focus_set()
+        text = ""
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            pass
+        if not text and shutil.which("pbpaste"):
+            try:
+                text = subprocess.run(
+                    ["pbpaste"], capture_output=True, text=True, timeout=2
+                ).stdout
+            except Exception:
+                text = ""
+        if not text:
+            self.status_var.set("Clipboard is empty or unavailable")
+            return "break"
+        paths = self.clipboard_file_paths(text)
+        if paths:
+            self.import_paths(paths, source="pasted")
+            return "break"
+        try:
+            self.input.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        self.input.insert("insert", text)
+        self.input.see("insert")
+        self.status_var.set(f"Pasted {len(text)} chars")
+        return "break"
+
+    def clipboard_file_paths(self, text):
+        candidates = []
+        if shutil.which("pbpaste"):
+            try:
+                file_text = subprocess.run(
+                    ["pbpaste", "-Prefer", "file"], capture_output=True, text=True, timeout=2
+                ).stdout
+                candidates.extend(file_text.splitlines())
+            except Exception:
+                pass
+        candidates.extend(text.splitlines())
+        if text.strip().startswith("{") and text.strip().endswith("}"):
+            candidates.extend(part for part in text.strip()[1:-1].split("} {") if part)
+        paths = []
+        for raw in candidates:
+            item = raw.strip().strip('"').strip("'")
+            if not self.looks_like_file_path(item):
+                continue
+            if item.startswith("file://"):
+                item = urllib.parse.unquote(urllib.parse.urlparse(item).path)
+            p = pathlib.Path(item).expanduser()
+            try:
+                is_file = p.exists() and p.is_file()
+            except OSError:
+                is_file = False
+            if is_file:
+                paths.append(str(p))
+        deduped = []
+        seen = set()
+        for path in paths:
+            if path not in seen:
+                seen.add(path)
+                deduped.append(path)
+        return deduped
+
+    def looks_like_file_path(self, item):
+        if not item or len(item) > 1024 or "\n" in item:
+            return False
+        if item.startswith("file://"):
+            return True
+        expanded = item.replace("~", str(pathlib.Path.home()), 1)
+        return expanded.startswith("/") or expanded.startswith("./") or expanded.startswith("../")
+
+    def send_from_keyboard(self, event):
+        if event.state & 0x0001:
+            return None
+        self.send()
+        return "break"
+
+    def start_server_and_models(self):
+        if not ensure_server(self.backend, self.url, self.key, self.status):
+            return
+        try:
+            models = list_models(self.url, self.key)
+        except Exception as exc:
+            self.status(f"Could not load models: {exc}")
+            return
+        self.events.put(("models", models))
+        self.status("Ready")
+
+    def choose_backend_on_launch(self):
+        choices = "\n".join(
+            f"{index}) {backend_label(name)} - {backend_description(name)}"
+            for index, name in enumerate(SUPPORTED_BACKENDS, 1)
+        )
+        selected = simpledialog.askstring(
+            "mlxgui Backend",
+            f"Choose backend (Enter for {backend_label(self.backend)}):\n\n{choices}",
+            initialvalue=str(SUPPORTED_BACKENDS.index(self.backend) + 1),
+            parent=self,
+        )
+        if selected is not None and selected.strip():
+            selected = selected.strip().lower()
+            if selected in SUPPORTED_BACKENDS:
+                self.backend = selected
+            else:
+                try:
+                    self.backend = SUPPORTED_BACKENDS[int(selected) - 1]
+                except (ValueError, IndexError):
+                    self.status_var.set("Invalid backend; using the previous backend")
+        self.backend_var.set(backend_label(self.backend))
+        self.url, self.key = load_backend_cfg(self.backend)
+        save_backend(self.backend)
+        self.update_hero_subtitle()
+        stop_other_backend(self.backend, self.status)
+        threading.Thread(target=self.start_server_and_models, daemon=True).start()
+
+    def backend_selection_changed(self, _event=None):
+        selected_label = self.backend_var.get()
+        selected = next(
+            (name for name in SUPPORTED_BACKENDS if backend_label(name) == selected_label),
+            self.backend,
+        )
+        self.switch_backend(selected)
+
+    def switch_backend(self, backend):
+        if backend == self.backend:
+            return
+        if self.busy:
+            messagebox.showinfo("Backend", "Wait for the current response to finish before switching backends.")
+            self.backend_var.set(backend_label(self.backend))
+            return
+        self.backend = backend
+        self.backend_var.set(backend_label(backend))
+        self.url, self.key = load_backend_cfg(backend)
+        save_backend(backend)
+        self.model_var.set("")
+        self.model_box.configure(values=[])
+        self.status_var.set(f"Switching to {backend_label(backend)}...")
+        self.update_hero_subtitle()
+        threading.Thread(target=self.restart_backend, daemon=True).start()
+
+    def restart_backend(self):
+        stop_other_backend(self.backend, self.status)
+        self.start_server_and_models()
+
+    def import_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Import one or more files",
+            initialdir=str(load_default_dir()),
+        )
+        if not paths:
+            return
+        self.import_paths(paths)
+
+    def insert_file_references(self):
+        paths = filedialog.askopenfilenames(
+            title="Select files to reference in your request",
+            initialdir=str(load_default_dir()),
+        )
+        if not paths:
+            return
+        references = "\n".join(f"- {pathlib.Path(path)}" for path in paths)
+        existing = self.input.get("1.0", "end-1c").strip()
+        prefix = f"{existing}\n\n" if existing else ""
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", f"{prefix}Files:\n{references}\n")
+        self.input.focus_set()
+        self.status_var.set(f"Added {len(paths)} file reference(s) to the request")
+
+    def import_paths(self, paths, source="imported"):
+        mode = self.convert_var.get()
+        sections = []
+        labels = []
+        try:
+            for path in paths:
+                text, label = convert_file(path, mode)
+                clipped = text[:MAX_FILE_CHARS]
+                note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
+                sections.append(f"Contents of {label}:\n\n{clipped}{note}")
+                labels.append(label)
+        except Exception as exc:
+            messagebox.showerror("Import failed", f"No files were imported.\n\n{exc}")
+            return
+        content = "\n\n---\n\n".join(sections)
+        self.messages.append({"role": "user", "content": content})
+        self.messages = trim(self.messages)
+        self.append(f"\n[{source} {len(labels)} file(s) as {mode}: {', '.join(labels)}]\n")
+        self.update_resource_indicator()
+        self.status_var.set(f"Imported {len(labels)} file(s)")
+
+    def export_reply(self):
+        content = self.latest_reply_text()
+        if not content:
+            messagebox.showinfo("No reply", "There is no model reply to export yet.")
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="Export latest model reply",
+            initialdir=str(load_default_dir()),
+            initialfile=f"mlxgui-reply-{stamp}.docx",
+            defaultextension=".docx",
+            filetypes=[
+                ("Word document", "*.docx"),
+                ("Markdown", "*.md"),
+                ("Plain text", "*.txt"),
+            ],
+        )
+        if not path:
+            return
+        target = pathlib.Path(path).expanduser()
+        try:
+            if target.suffix.lower() == ".docx":
+                markdown_to_docx(target, "mlxgui Export", content)
+            elif target.suffix.lower() == ".md":
+                target.write_text(content)
+            elif target.suffix.lower() == ".txt":
+                target.write_text(markdown_to_text(content))
+            else:
+                target.write_text(content)
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        self.status_var.set(f"Exported {target.name}")
+        self.append(f"\n[exported latest reply to {target}]\n")
+
+    def dialogue_context_data(self):
+        return {
+            "version": 1,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "system_prompt": self.system_prompt,
+            "messages": self.messages,
+            "totals": self.totals,
+            "last_turn_tokens": self.last_turn_tokens,
+            "model": self.model_var.get(),
+            "convert_mode": self.convert_var.get(),
+            "rag_folder": self.chat_rag_folder_var.get(),
+        }
+
+    def save_dialogue_context(self):
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="Save dialogue context",
+            initialdir=str(SESSIONS_DIR),
+            initialfile=f"mlxgui-context-{stamp}.json",
+            defaultextension=".json",
+            filetypes=[("Dialogue context", "*.json")],
+        )
+        if not path:
+            return
+        target = pathlib.Path(path).expanduser()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(self.dialogue_context_data(), indent=2))
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+            return
+        self.status_var.set(f"Saved dialogue context to {target.name}")
+
+    def load_dialogue_context(self):
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        path = filedialog.askopenfilename(
+            title="Load dialogue context",
+            initialdir=str(SESSIONS_DIR),
+            filetypes=[("Dialogue context", "*.json"), ("JSON", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(pathlib.Path(path).expanduser().read_text())
+            messages = data.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("No saved message context found.")
+            self.system_prompt = data.get("system_prompt") or DEFAULT_SYSTEM
+            self.messages = messages
+            if self.messages[0].get("role") != "system":
+                self.messages.insert(0, {"role": "system", "content": self.system_prompt})
+            else:
+                self.messages[0]["content"] = self.system_prompt
+            totals = data.get("totals") or {}
+            self.totals = {"in": int(totals.get("in") or 0), "out": int(totals.get("out") or 0)}
+            last_turn = data.get("last_turn_tokens") or {}
+            self.last_turn_tokens = {
+                "in": int(last_turn.get("in") or 0),
+                "out": int(last_turn.get("out") or 0),
+            }
+            mode = data.get("convert_mode")
+            if mode in CONVERT_MODES:
+                self.convert_var.set(mode)
+            self.chat_rag_folder_var.set(data.get("rag_folder") or "")
+            model = data.get("model")
+            if model:
+                self.model_var.set(model_label(model) if self.model_display_to_id else model)
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc))
+            return
+        self.render_loaded_context()
+        self.tokens_var.set(f"tokens: in {self.totals['in']:,} / out {self.totals['out']:,}")
+        self.update_resource_indicator()
+        self.update_memory_indicator()
+        self.current_stream_start = None
+        self.current_stream_end = None
+        self.pending_user_index = None
+        self.cancel_requested = False
+        self.status_var.set(f"Loaded dialogue context from {pathlib.Path(path).name}")
+
+    def render_loaded_context(self):
+        self.chat.configure(state="normal")
+        self.chat.delete("1.0", "end")
+        for message in self.messages:
+            role = message.get("role")
+            content = message.get("content") or ""
+            if role == "system" or not content:
+                continue
+            if role == "user":
+                self.append_tagged(f"\n{content}\n", "user_bubble")
+            elif role == "assistant":
+                self.append_tagged("Assistant\n", "assistant_label")
+                start = self.chat.index("end-1c")
+                self.append_model_text(content)
+                end = self.chat.index("end-1c")
+                self.style_assistant_range(start, end)
+            elif role == "tool":
+                self.append_tagged(f"\n[tool]\n{content}\n", "meta")
+
+    def reset_chat_state(self, keep_rag=True):
+        if not keep_rag:
+            self.chat_rag_folder_var.set("")
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+        notes_path, notes_text = find_project_notes()
+        if notes_text:
+            self.messages[0]["content"] += f"\n\nProject notes from {notes_path}:\n\n{notes_text}"
+        artifact_note = last_artifact_system_note()
+        if artifact_note:
+            self.messages[0]["content"] += f"\n\n{artifact_note}"
+        self.totals = {"in": 0, "out": 0}
+        self.last_turn_tokens = {"in": 0, "out": 0}
+        self.last_user_text = ""
+        self.refining = False
+        self.pending_user_index = None
+        self.cancel_requested = False
+        self.tokens_var.set("tokens: in 0 / out 0")
+        self.update_resource_indicator()
+        self.update_memory_indicator()
+        self.chat.configure(state="normal")
+        self.chat.delete("1.0", "end")
+        self.input.delete("1.0", "end")
+        self.current_stream_start = None
+        self.current_stream_end = None
+
+    def new_chat(self):
+        keep_rag = True
+        if self.chat_rag_folder_var.get().strip():
+            keep = messagebox.askyesnocancel(
+                "New Chat",
+                "Keep the current chat RAG folder for the new chat?\n\n"
+                "Yes: start a new chat and keep the RAG folder.\n"
+                "No: start a new chat and clear the RAG folder.\n"
+                "Cancel: stay in the current chat.",
+            )
+            if keep is None:
+                return
+            keep_rag = keep
+        self.reset_chat_state(keep_rag=keep_rag)
+        if keep_rag and self.chat_rag_folder_var.get().strip():
+            self.status_var.set("Started new chat and kept the current RAG folder")
+        else:
+            self.status_var.set("Started new chat")
+
+    def clear_chat(self):
+        self.reset_chat_state(keep_rag=True)
+        self.status_var.set("Cleared current chat")
+
+    def send(self):
+        if self.busy or self.refining:
+            return
+        text = self.input.get("1.0", "end-1c").strip()
+        if not text:
+            return
+        if text.startswith("?"):
+            self.input.delete("1.0", "end")
+            self.refine_prompt(text[1:].strip() or None)
+            return
+        import mlxlib as _ml
+        _tm = _ml.tokenmax_request(text)
+        if _tm is not None:
+            self.input.delete("1.0", "end")
+            self.run_tokenmax_job(text, _tm)
+            return
+        model = self.selected_model_id()
+        if not model:
+            messagebox.showinfo("No model", "Wait for models to load first.")
+            return
+        self.input.delete("1.0", "end")
+        self.last_user_text = text
+        self.messages.append({"role": "user", "content": text})
+        self.messages = trim(self.messages)
+        self.pending_user_index = len(self.messages) - 1
+        self.cancel_requested = False
+        self.update_resource_indicator()
+        self.append_tagged(f"\n{text}\n", "user_bubble")
+        self.append_tagged("Assistant\n", "assistant_label")
+        self.current_stream_start = self.chat.index("end-1c")
+        self.current_stream_end = self.current_stream_start
+        self.turn_start_time = time.time()
+        self.busy = True
+        self.send_button.configure(state="disabled")
+        self.start_working("Waiting for model response")
+        self.show_working_indicator("Waiting for model response")
+        threading.Thread(target=self.stream_reply, args=(model,), daemon=True).start()
+
+    def run_tokenmax_job(self, text, rest):
+        """One request handed to tokenmax (chosen per request with 'using tokenmax, ...' or '/tokenmax ...')."""
+        import mlxlib as _ml
+        self.append_tagged(f"\n{text}\n", "user_bubble")
+        argv = _ml.tokenmax_argv(rest, self.backend, self.selected_model_id())
+        if argv is None:
+            self.append_tagged(_ml.TOKENMAX_USAGE + "\n", "meta")
+            return
+        self.append_tagged("tokenmax\n", "assistant_label")
+        self.busy = True
+        self.send_button.configure(state="disabled")
+        self.status("tokenmax is working...")
+
+        def worker():
+            try:
+                proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                for line in proc.stdout:
+                    self.after(0, self.append_tagged, line, "assistant_body")
+                proc.wait()
+            except Exception as exc:
+                self.after(0, self.append_tagged, f"(could not run tokenmax: {exc})\n", "meta")
+            def done():
+                self.busy = False
+                self.send_button.configure(state="normal")
+                self.status("Ready")
+            self.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def stream_reply(self, model):
+        # Guard the whole turn (all agentic tool-call retries included) so a
+        # long local generation can't get killed by the Mac going to sleep.
+        # server_busy_guard is the other half: mlxcli already held this same
+        # exclusive lock for its own turns, but mlxgui never acquired it,
+        # meaning a GUI request could hit the model server concurrently with
+        # an in-flight mlxcli turn instead of waiting its turn -- a real
+        # incident traced to exactly this gap (a headless mlxcli --run died
+        # silently, no traceback, right around when a GUI command was sent).
+        with caffeinate_guard(), server_busy_guard(on_wait=self.status):
+            self._stream_reply_body(model)
+
+    def _stream_reply_body(self, model):
+        request_messages, context_status, context_error = request_messages_with_context(
+            self.messages,
+            self.last_user_text,
+            self.chat_rag_folder_var.get(),
+        )
+        if context_status:
+            self.events.put(("status", context_status))
+        if context_error:
+            self.events.put(("append", f"\n[error] {context_error}\n"))
+            self.events.put(("done", "", {}))
+            return
+        working_messages = list(request_messages)
+        agentic = gui_should_auto_enable_agentic(self.last_user_text)
+        execution_required = gui_requires_agentic_execution(self.last_user_text)
+        contract = gui_execution_contract(self.last_user_text)
+        backend_suggestion = gui_suggest_better_backend(self.backend, self.last_user_text)
+        if backend_suggestion:
+            self.events.put(("status", f"Suggestion: {backend_suggestion}"))
+        tool_state = {"write": False, "run": False, "verify": False}
+        seen_tool_calls = {}
+        retried_with_tools = False
+        repetition_streak = 0
+        if agentic:
+            agentic_note = (
+                "Agentic local-resource task: use tools for all file reads, writes, commands, and verification. "
+                "Do not simulate tool calls or claim completion without successful tool results and exact path evidence. "
+                "Do not repeat identical tool calls after a successful result; reuse the returned evidence, and preserve stronger existing file validation. write_file always shows the user a preview and asks for approval before an existing file is changed, so call it directly rather than staging a copy elsewhere first. "
+                "write_file creates parent directories, so do not issue a separate mkdir unless it is actually required."
+            )
+            if working_messages and working_messages[0].get("role") == "system":
+                working_messages[0] = {"role": "system", "content": working_messages[0]["content"] + "\n\n" + agentic_note}
+            else:
+                working_messages.insert(0, {"role": "system", "content": agentic_note})
+        effective_agentic = agentic
+        model_settings = load_model_settings(self.backend)
+        for _step in range(MAX_TOOL_STEPS):
+            payload = {
+                "model": model, "messages": working_messages,
+                "max_tokens": model_settings["max_tokens"], "stream": True,
+                "stream_options": {"include_usage": True},
+                "temperature": model_settings["temperature"],
+                "top_p": model_settings["top_p"],
+                "top_k": model_settings["top_k"],
+                "repetition_penalty": model_settings["repetition_penalty"],
+            }
+            # Tools are always offered, regardless of effective_agentic --
+            # effective_agentic still controls the extra "Agentic local-resource
+            # task" system note below, but gating the tools array itself on a
+            # keyword heuristic made every tool, including web_search,
+            # unreachable for any request that heuristic didn't recognize (a
+            # plain factual question has no reason to mention "file" or
+            # "script", so it never would have qualified) -- the model's own
+            # judgment plus each tool's description and the system prompt's
+            # usage rules are what should gate whether a given tool actually
+            # gets called, not whether it's offered.
+            payload["tools"] = all_tool_schemas()
+            # "-fast" strips tools/system prompt server-side; tool-bearing requests use the base model id.
+            if payload["model"].endswith("-fast"):
+                payload["model"] = payload["model"][:-len("-fast")]
+            parts, calls, usage = [], {}, {}
+            stream_error = None
+            repetition_detected = False
+            chunks_since_check = 0
+            try:
+                with urllib.request.urlopen(request(self.url, self.key, "/v1/chat/completions", payload), timeout=900) as resp:
+                    for rawline in resp:
+                        if self.cancel_requested:
+                            self.events.put(("canceled", "".join(parts)))
+                            return
+                        line = rawline.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        if chunk.get("error"):
+                            stream_error = chunk["error"]
+                            break
+                        if chunk.get("usage"):
+                            usage = chunk["usage"]
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") or {}
+                        piece = delta.get("content")
+                        if piece:
+                            parts.append(piece)
+                            if not effective_agentic:
+                                self.events.put(("append", piece))
+                            chunks_since_check += 1
+                            # Check periodically rather than on every token — cheap
+                            # at this cadence, and stopping within ~15 chunks of a
+                            # stuck model is what matters, not the exact first repeat.
+                            if chunks_since_check >= 15:
+                                chunks_since_check = 0
+                                if gui_detect_repetition_loop("".join(parts)):
+                                    repetition_detected = True
+                                    break
+                        for tool_call in delta.get("tool_calls") or []:
+                            index = tool_call.get("index", 0)
+                            slot = calls.setdefault(index, {"id": None, "name": "", "arguments": ""})
+                            slot["id"] = tool_call.get("id") or slot["id"]
+                            function = tool_call.get("function") or {}
+                            slot["name"] += function.get("name") or ""
+                            slot["arguments"] += function.get("arguments") or ""
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace").strip()[:400]
+                log_error("gui_chat_turn", f"HTTP {exc.code} (backend={self.backend}, model={payload.get('model')}): {detail}")
+                self.events.put(("append", f"\n[error] HTTP {exc.code}: {detail}\n"))
+                self.events.put(("done", "", usage))
+                return
+            except Exception as exc:
+                if self.cancel_requested:
+                    self.events.put(("canceled", "".join(parts)))
+                else:
+                    log_error("gui_chat_turn", f"{type(exc).__name__} (backend={self.backend}, model={payload.get('model')}): {exc}")
+                    self.events.put(("append", f"\n[error] {exc}\n"))
+                    self.events.put(("done", "", usage))
+                return
+            if repetition_detected:
+                repetition_streak += 1
+                self.events.put(("status", "Model generation fell into a repetition loop; stopped early"))
+                if repetition_streak >= 2:
+                    # It fell into the identical failure mode twice in a row for
+                    # this request — further retries are very unlikely to help.
+                    self.events.put(("append", "\n[stopped: the model repeated the same generation-loop failure twice in a row; try rephrasing the request]\n"))
+                    self.events.put(("done", "", usage))
+                    return
+            else:
+                repetition_streak = 0
+            if stream_error:
+                # The model attempted a tool call the server couldn't resolve, most often
+                # because conversation history primed it to keep calling tools even on a
+                # turn where none were declared. Give it a real chance to use one before
+                # treating the truncated response as if it were a normal, complete answer.
+                if not effective_agentic and not retried_with_tools:
+                    retried_with_tools = True
+                    effective_agentic = True
+                    self.events.put(("status", "Server rejected an unexpected tool call; retrying with tools enabled"))
+                    continue
+                self.events.put(("append", f"\n[server error mid-generation: {stream_error}; response above may be incomplete]\n"))
+            tool_calls = [{"id": slot["id"] or f"gui_call_{index}", "type": "function",
+                           "function": {"name": slot["name"], "arguments": slot["arguments"]}}
+                          for index, slot in sorted(calls.items())]
+            content = "".join(parts)
+            # These fallback parsers used to be gated on effective_agentic too,
+            # back when tools were only sometimes offered -- now that tools are
+            # always in the payload (see above), a model can attempt a
+            # non-standard-format tool call on any turn, so these need to run
+            # unconditionally too, matching mlxcli's already-unconditional
+            # equivalent (mlxcli never gated these on agentic_mode).
+            if not tool_calls:
+                tool_calls = parse_gui_text_tool_calls(content)
+                if tool_calls:
+                    self.events.put(("status", "Compatibility text tool call parsed"))
+            if not tool_calls:
+                tool_calls = gui_parse_bare_json_tool_call(content)
+                if tool_calls:
+                    self.events.put(("status", "Compatibility bare-JSON tool call parsed"))
+            if not tool_calls:
+                tool_calls = gui_parse_xml_tag_tool_call(content)
+                if tool_calls:
+                    self.events.put(("status", "Compatibility XML-tag tool call parsed"))
+            if not tool_calls:
+                tool_calls = gui_parse_python_call_tool_call(content)
+                if tool_calls:
+                    self.events.put(("status", "Compatibility Python-call-style tool call parsed"))
+            if not tool_calls:
+                tool_calls = gui_parse_attr_tag_tool_call(content)
+                if tool_calls:
+                    self.events.put(("status", "Compatibility attribute-tag-style tool call parsed"))
+            if not tool_calls:
+                if execution_required and _step == 0:
+                    # The model answered with prose and never attempted a tool
+                    # call at all - force at least one real attempt before
+                    # falling back to the narrower per-category contract check
+                    # below, which can legitimately require nothing yet still
+                    # need enforcement (e.g. a bare "open <path>" request).
+                    working_messages.append({"role": "assistant", "content": content})
+                    working_messages.append({"role": "user", "content": (
+                        "Execution required for this request. You did not call a tool. "
+                        "Do not report completion. Use run_command, read_file, or write_file now to perform the "
+                        "requested actions, then verify the exact output paths before responding."
+                    )})
+                    self.events.put(("status", "Model returned prose without performing the requested file operation; requesting tool execution"))
+                    continue
+                unmet = [name for name, required in contract.items() if required and not tool_state.get(name)]
+                if unmet and _step < MAX_TOOL_STEPS - 1:
+                    working_messages.append({"role": "assistant", "content": content})
+                    working_messages.append({"role": "user", "content": (
+                        "Do not claim completion. Missing tool evidence for: " + ", ".join(unmet) +
+                        ". Use the available tools and verify exact paths before responding."
+                    )})
+                    self.events.put(("status", f"Requesting missing tool actions: {', '.join(unmet)}"))
+                    continue
+                if unmet:
+                    self.events.put(("append", f"\n[unverified: missing tool evidence for {', '.join(unmet)}]\n"))
+                    self.events.put(("done", "", usage))
+                    return
+                if effective_agentic and content:
+                    self.events.put(("append", content))
+                self.events.put(("done", content, usage))
+                return
+            clean_content = "" if "call:" in content else content
+            assistant_tool_message = {"role": "assistant", "content": clean_content or None, "tool_calls": tool_calls}
+            working_messages.append(assistant_tool_message)
+            self.events.put(("tool_history", assistant_tool_message))
+            repeated_failure = False
+            for call in tool_calls:
+                call["function"]["name"] = gui_normalize_tool_name(call["function"]["name"])
+                try:
+                    args = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                self.events.put(("status", f"Running tool: {call['function']['name']}"))
+                call_key = (call["function"]["name"], json.dumps(args, sort_keys=True, ensure_ascii=False))
+                if call_key in seen_tool_calls:
+                    result = seen_tool_calls[call_key]
+                    self.events.put(("status", "Duplicate tool call suppressed; reusing prior result"))
+                    if gui_tool_failed(result):
+                        repeated_failure = True
+                else:
+                    result = self.execute_tool(call["function"]["name"], args)
+                    seen_tool_calls[call_key] = result
+                if self.cancel_requested:
+                    self.events.put(("canceled", content))
+                    return
+                if not gui_tool_failed(result):
+                    if call["function"]["name"] == "write_file":
+                        tool_state["write"] = True
+                    if call["function"]["name"] in {"run_command", "python_interpreter"}:
+                        tool_state["run"] = True
+                    if call["function"]["name"] == "read_file" or (
+                        call["function"]["name"] in {"run_command", "python_interpreter"}
+                        and "stat " in args.get("command", "")
+                    ):
+                        tool_state["verify"] = True
+                working_messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                self.events.put(("tool_history", working_messages[-1]))
+            if repeated_failure:
+                self.events.put(("append", "\n[stopped: the model repeated an already-failed tool call instead of adapting]\n"))
+                self.events.put(("done", "", usage))
+                return
+        self.events.put(("append", "\n[stopped: too many tool steps]\n"))
+        self.events.put(("done", "", {}))
+
+    def selected_model_id(self):
+        selected = self.model_var.get()
+        return resolve_model_id(selected, self.model_display_to_id)
+
+    def drain_events(self):
+        try:
+            while True:
+                event = self.events.get_nowait()
+                kind = event[0]
+                if kind == "approval":
+                    _kind, description, approval_event, approval_result = event
+                    if self.cancel_requested or approval_result.get("cancelled"):
+                        approval_result["approved"] = False
+                    else:
+                        approval_result["approved"] = messagebox.askyesno("Approve local tool action", description, parent=self)
+                    approval_event.set()
+                elif kind == "tool_history":
+                    self.messages.append(event[1])
+                elif kind == "append":
+                    self.hide_working_indicator()
+                    self.append_model_text(event[1])
+                elif kind == "refined":
+                    _raw_request, refined, usage = event[1], event[2], event[3]
+                    self.refining = False
+                    self.refine_button.configure(state="normal")
+                    self.stop_working()
+                    in_tokens, out_tokens = usage_counts(usage)
+                    self.totals["in"] += in_tokens
+                    self.totals["out"] += out_tokens
+                    if refined:
+                        self.input.delete("1.0", "end")
+                        self.input.insert("1.0", refined)
+                        self.input.focus_set()
+                        self.status_var.set(
+                            f"Prompt refined; review and press Send (in {in_tokens:,} / out {out_tokens:,})"
+                        )
+                    else:
+                        self.status_var.set("Refiner returned no text; original prompt retained")
+                elif kind == "refine_error":
+                    self.refining = False
+                    self.refine_button.configure(state="normal")
+                    self.stop_working()
+                    self.status_var.set("Prompt refinement failed")
+                    self.append(f"\n[refiner error] {event[1]}\n")
+                elif kind == "status":
+                    self.status_var.set(event[1])
+                    self.show_working_indicator(event[1])
+                elif kind == "server_status":
+                    self.update_hero_status(event[1])
+                elif kind == "repo_updates":
+                    _kind, label, info, silent = event
+                    if info:
+                        self.show_repo_update_indicator(label, info)
+                        if not silent:
+                            self.show_repo_update_details()
+                    elif not silent:
+                        self.status_var.set(f"{label}: no updates found")
+                elif kind == "model_updates":
+                    _kind, label, info, silent = event
+                    if info:
+                        self.show_model_update_indicator(label, info)
+                        if not silent:
+                            self.show_model_update_details()
+                    elif not silent:
+                        self.status_var.set(f"{label}: no model updates found")
+                elif kind == "models":
+                    models = event[1]
+                    labels = [model_label(model) for model in models]
+                    self.model_display_to_id = dict(zip(labels, models))
+                    self.model_box.configure(values=labels)
+                    if models:
+                        self.model_var.set(labels[0])
+                elif kind == "done":
+                    self.hide_working_indicator()
+                    content, usage = event[1], event[2]
+                    self.pending_user_index = None
+                    self.cancel_requested = False
+                    if content:
+                        if self.current_stream_start and self.current_stream_end:
+                            self.style_assistant_range(self.current_stream_start, self.current_stream_end)
+                        self.messages.append({"role": "assistant", "content": content})
+                        if self.autosave_docx_requested():
+                            try:
+                                self.save_docx_content(content)
+                            except Exception as exc:
+                                self.append(f"\n[could not save Word document: {exc}]\n")
+                    in_tokens, out_tokens = usage_counts(usage)
+                    elapsed = (time.time() - self.turn_start_time) if self.turn_start_time else None
+                    rate = f" / {out_tokens / elapsed:.1f} tok/s" if elapsed and elapsed > 0 and out_tokens > 0 else ""
+                    if elapsed and elapsed > 0:
+                        rate += f" / run time {elapsed:.1f}s" if elapsed < 60 else f" / run time {int(elapsed // 60)}m {int(elapsed % 60):02d}s"
+                    self.turn_start_time = None
+                    self.last_turn_tokens = {"in": in_tokens, "out": out_tokens}
+                    self.totals["in"] += in_tokens
+                    self.totals["out"] += out_tokens
+                    self.tokens_var.set(
+                        f"tokens: in {self.totals['in']:,} / out {self.totals['out']:,}"
+                    )
+                    self.update_resource_indicator()
+                    self.update_memory_indicator()
+                    self.status_var.set(f"Ready - last turn: in {in_tokens:,} / out {out_tokens:,}{rate}")
+                    self.busy = False
+                    self.stop_working()
+                    self.send_button.configure(state="normal")
+                    self.current_stream_start = None
+                    self.current_stream_end = None
+                elif kind == "canceled":
+                    self.finish_canceled_response(event[1])
+        except queue.Empty:
+            pass
+        self.after(60, self.drain_events)
+
+
+if __name__ == "__main__":
+    MlxGui().mainloop()
