@@ -23,6 +23,7 @@ DESKTOP_DIR="${MLXCLI_CHAT_DESKTOP:-$HOME/Desktop}"
 BIN_DIR="${MLXCLI_CHAT_BIN:-$HOME/.local/bin}"
 OMLX_HOME="${MLXCLI_CHAT_OMLX_HOME:-$HOME/.omlx}"
 
+ORIG_ARGS=("$@")   # kept so the curl|bash path can pass the same options to the downloaded copy
 MODELS="both"; SKIP_OMLX=0; NO_DESKTOP=0; ASSUME_YES=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -51,7 +52,7 @@ if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/app" ]; then
   curl -fsSL "https://github.com/$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$TMP"
   SRC="$(echo "$TMP"/mlxcli-chat-*)"
   [ -d "$SRC/app" ] || die "could not download the mlxcli-chat files from GitHub."
-  exec bash "$SRC/install.sh" "$@"
+  exec bash "$SRC/install.sh" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
 fi
 SRC="$SCRIPT_DIR"
 
@@ -93,7 +94,7 @@ if [ ! -x "$UV" ]; then
 fi
 export UV_PYTHON_INSTALL_DIR="$BASE/python"
 export UV_PYTHON_PREFERENCE="only-managed"   # ignore any Python already on this Mac (may be old, Intel-only, or broken)
-"$UV" python install --quiet "$PYTHON_VERSION"
+"$UV" python install --quiet --no-bin "$PYTHON_VERSION"
 rm -rf "$BASE/venv"
 "$UV" venv --quiet --python "$PYTHON_VERSION" "$BASE/venv"
 "$UV" pip install --quiet --python "$BASE/venv/bin/python" psutil websockets huggingface_hub
@@ -128,10 +129,10 @@ else
 fi
 
 # ---- 4. models ---------------------------------------------------------------------------------
-# Use the model folder oMLX is already configured for, else its default (~/.omlx/models).
+# Use the model folder oMLX is already configured for, else its default (models/ inside the oMLX folder).
 MODEL_DIR="$("$BASE/venv/bin/python" - "$OMLX_HOME/settings.json" <<'PY'
 import json, os, sys
-d = os.path.expanduser("~/.omlx/models")
+d = os.path.join(os.path.dirname(sys.argv[1]), "models")
 try:
     d = json.load(open(sys.argv[1])).get("model", {}).get("model_dir") or d
 except Exception:

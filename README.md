@@ -7,6 +7,16 @@ A private chat and document-writing assistant that runs **entirely on your Mac**
 
 It is built from [mlxcli](https://github.com/jlrosssc/mlxcli), set up for everyday chat, writing and summarizing instead of coding. It uses [oMLX](https://github.com/jundot/omlx) to run the models on Apple Silicon.
 
+## Quick install
+
+Open **Terminal** (press Cmd+Space, type `Terminal`, press Return), paste this one line, and press Return:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jlrosssc/mlxcli-chat/main/install.sh | bash
+```
+
+When it finishes, a blue chat icon named **mlxgui-chat** is on your Desktop. Prefer no Terminal at all? See [Install](#install-about-1530-minutes-mostly-downloading) below for the double-click option.
+
 <p align="center"><img src="assets/icon_1024.png" width="128" alt="mlxgui-chat icon"></p>
 
 ## What you need
