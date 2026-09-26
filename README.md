@@ -26,7 +26,7 @@ When it finishes, a blue chat icon named **mlxgui-chat** is on your Desktop. Pre
 | Mac | Apple Silicon (M1, M2, M3, M4 or newer). Intel Macs are not supported. |
 | macOS | 15 (Sequoia) or newer |
 | Memory | **16 GB or more** (the models are 12–14 billion parameters) |
-| Free disk | About 25 GB (about 17 GB for both models, 9 GB for one) |
+| Free disk | About 25 GB (about 15 GB for both models, 8 GB for one) |
 | Internet | For the one-time download only. Afterwards it works offline. |
 
 ## Install (about 15–30 minutes, mostly downloading)
@@ -66,7 +66,7 @@ Terminal version: `mlxcli-chat` (if the command isn't found, add `~/.local/bin` 
 | Model | Size | Good at |
 |---|---|---|
 | **Gemma 3 12B (4-bit)** — the default | ~8 GB | writing, summarizing, rewriting, general chat |
-| Qwen3 14B (4-bit) | ~9 GB | structured or analytical documents, step-by-step reasoning |
+| Qwen3 14B (4-bit) | ~8 GB | structured or analytical documents, step-by-step reasoning |
 
 Gemma is what opens by default. Use the model menu at the top of the window to switch to Qwen. To change the default, edit `~/.omlx/default_model.txt` (it holds part of a model name, such as `gemma-3-12b` or `Qwen3-14B`).
 
