@@ -411,6 +411,11 @@ class ChatWindow(QMainWindow):
         was_at_bottom = self._at_bottom()
         cursor = QTextCursor(self.chat.document())
         cursor.movePosition(QTextCursor.End)
+        # insertHtml() continues in the CURRENT paragraph unless told otherwise -- without this, each
+        # new message ran on right after the previous one instead of starting its own line, like a
+        # normal chat window's stacked messages.
+        if not self.chat.document().isEmpty():
+            cursor.insertBlock()
         cursor.insertHtml(html_block)
         if was_at_bottom:
             self._scroll_to_bottom()
@@ -431,6 +436,7 @@ class ChatWindow(QMainWindow):
         self._append_html_block('<div style="color:#7a7a73;font-size:13px;margin-top:8px;">Assistant</div>')
         cursor = QTextCursor(self.chat.document())
         cursor.movePosition(QTextCursor.End)
+        cursor.insertBlock()  # the streamed reply starts its own line below the "Assistant" label, not on it
         self._assistant_pos = cursor.position()
         self._assistant_raw = ""
 
