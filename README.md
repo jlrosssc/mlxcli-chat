@@ -55,6 +55,16 @@ If a download is interrupted, just run the installer again. It picks up where it
 
 Options: `--models gemma` or `--models qwen` (download only one, saves about 8 GB), `--skip-omlx`, `--no-desktop`, `--yes`.
 
+## Update
+
+To get the latest fixes, run the installer again. It keeps oMLX and your downloaded models, and finishes in about a minute:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jlrosssc/mlxcli-chat/main/install.sh | bash -s -- --models none
+```
+
+(Prefer no Terminal? Download the ZIP again and double-click **Install mlxcli-chat.command**.) Quit mlxgui-chat first if it is open.
+
 ## Use it
 
 Double-click the blue chat icon named **mlxgui-chat** on your Desktop. The first launch takes a little longer while the model server starts. If macOS asks whether to open oMLX, click **Open**.
