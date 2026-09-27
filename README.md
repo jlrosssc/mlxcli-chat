@@ -55,7 +55,7 @@ If a download is interrupted, just run the installer again. It picks up where it
 
 Options: `--models gemma` or `--models qwen` (download only one, saves about 8 GB), `--skip-omlx`, `--no-desktop`, `--yes`.
 
-The private Python (step 2) comes from Anaconda's package channel, which is free for personal use and small organizations; larger organizations need a paid plan (see [anaconda.com/pricing](https://www.anaconda.com/pricing)). Nothing else here depends on Anaconda, and this is the only step that does.
+The chat window is built with [Qt](https://www.qt.io/qt-for-python) (via PySide6, LGPL-licensed, free to use here), not Tk -- Tk's macOS text rendering had real bugs in earlier versions of this app (typing that vanished, then scrolling and text selection that did too). Qt adds a bit to the download (the private Python is about 550 MB instead of 200 MB); everything else about the install is unchanged.
 
 ## Update
 
@@ -84,6 +84,10 @@ Gemma is what opens by default. Use the model menu at the top of the window to s
 
 Models come from [Hugging Face](https://huggingface.co/mlx-community) and are subject to their own licenses (Gemma: Google's Gemma terms; Qwen3: Apache 2.0).
 
+## What this app does and doesn't do
+
+The window supports chat, document drafting, file reading/writing, running commands, and web search — each asks you to approve it first. It can save a reply as a Word document when you ask (e.g. "save this as a Word document"). It does not have a folder-wide document search (RAG), switch between different local model servers, or load or save named chat sessions.
+
 ## Safety
 
 - Everything runs locally. The models never send your text anywhere.
@@ -105,7 +109,7 @@ Double-click **Uninstall mlxcli-chat.command**. This removes the app, its Python
 ## What is in this repository
 
 - `install.sh`, `Install mlxcli-chat.command`, `Uninstall mlxcli-chat.command` — the installer and uninstaller
-- `app/` — the chat programs (`mlxcli`, `mlxgui.py`, `mlxlib.py`, and helpers), from [mlxcli](https://github.com/jlrosssc/mlxcli)
+- `app/` — the chat programs: `mlxcli` (terminal) and `mlxlib.py` (shared engine) come from [mlxcli](https://github.com/jlrosssc/mlxcli); `mlxgui.py` (the desktop window) is a Qt/PySide6 build specific to this repo
 - `launcher/` — the script behind the Desktop icon
 - `assets/` — the icon and the script that draws it
 

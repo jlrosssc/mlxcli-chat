@@ -45,7 +45,4 @@ if ! up; then
   up || { alert "The model server didn't start. Open oMLX from your Applications folder once, then try again."; exit 1; }
 fi
 
-# MLXCLI_CHAT_ONLY tells mlxgui to skip its backend-picker dialog and use oMLX straight away -- this
-# build is chat-only, so the user should only ever see the message window, never a server/backend choice.
-export MLXCLI_CHAT_ONLY=1
 exec "$BASE/venv/bin/python" "$BASE/app/mlxgui.py" "$@" >>"$LOG" 2>&1
