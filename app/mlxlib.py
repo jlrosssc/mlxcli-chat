@@ -2116,3 +2116,25 @@ def prefer_default_model(ids):
         if want in mid.lower():
             return [mid] + ids[:i] + ids[i + 1:]
     return ids
+
+
+def drop_orphan_tool_messages(messages):
+    """Remove `tool` messages that don't answer an earlier, still-unanswered assistant tool call.
+
+    Trimming a long history from the front can cut between an assistant message's tool_calls and the tool results
+    that follow it, leaving a `tool` message with no matching call. The server rejects the whole request with
+    400 "tool result must reference one unresolved call", and because the history is resent every turn it
+    keeps failing until /clear. Dropping the orphaned results (the call that produced them is already gone)
+    keeps the rest of the conversation valid."""
+    known, resolved, out = set(), set(), []
+    for m in messages:
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                known.add(tc.get("id"))
+        elif m.get("role") == "tool":
+            tid = m.get("tool_call_id")
+            if tid not in known or tid in resolved:
+                continue
+            resolved.add(tid)
+        out.append(m)
+    return out

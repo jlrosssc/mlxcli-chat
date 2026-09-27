@@ -3,7 +3,7 @@
 #
 # What it does (no admin password needed unless macOS asks to copy oMLX into /Applications):
 #   1. checks the Mac (Apple Silicon, macOS 15+, RAM, free disk)
-#   2. installs a private Python (with the Tk GUI toolkit) using uv -- nothing touches your system Python
+#   2. installs a private Python (with the Tk 8.6 GUI toolkit) using micromamba -- nothing touches your system Python
 #   3. installs oMLX, the local model server that runs the models
 #   4. downloads the chat models (Gemma 3 12B and Qwen3 14B, 4-bit) from Hugging Face
 #   5. puts an "mlxgui-chat" icon on your Desktop, and an `mlxcli-chat` terminal command in ~/.local/bin
@@ -84,22 +84,25 @@ cp -R "$SRC/app" "$BASE/app"
 cp "$SRC/assets/AppIcon.icns" "$BASE/AppIcon.icns"
 info "$BASE/app"
 
-say "Setting up Python (private copy, ~150 MB)"
-UV="$BASE/bin/uv"
-if [ ! -x "$UV" ]; then
+say "Setting up Python (private copy, ~200 MB)"
+# The chat window needs Tk 8.6. uv's standalone Pythons now ship Tk 9, where typing in the message box misbehaves,
+# so use micromamba + conda-forge instead: no admin rights needed, and nothing touches any Python already on this Mac.
+MM="$BASE/bin/micromamba"
+if [ ! -x "$MM" ]; then
   mkdir -p "$BASE/bin"
-  UVTMP="$(mktemp -d)"
-  curl -fsSL "https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-apple-darwin.tar.gz" | tar -xz -C "$UVTMP"
-  cp "$UVTMP"/uv-*/uv "$BASE/bin/uv"; chmod +x "$BASE/bin/uv"; rm -rf "$UVTMP"
+  curl -fsSL -o "$MM" "https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-osx-arm64" \
+    || die "could not download the Python installer. Check your internet connection and run this again."
+  chmod +x "$MM"
 fi
-export UV_PYTHON_INSTALL_DIR="$BASE/python"
-export UV_PYTHON_PREFERENCE="only-managed"   # ignore any Python already on this Mac (may be old, Intel-only, or broken)
-"$UV" python install --quiet --no-bin "$PYTHON_VERSION"
+export MAMBA_ROOT_PREFIX="$BASE/mamba"
 rm -rf "$BASE/venv"
-"$UV" venv --quiet --python "$PYTHON_VERSION" "$BASE/venv"
-"$UV" pip install --quiet --python "$BASE/venv/bin/python" psutil websockets huggingface_hub
+"$MM" create -y -q -p "$BASE/venv" -c conda-forge --override-channels \
+  "python=$PYTHON_VERSION" "tk=8.6.*" psutil websockets huggingface_hub \
+  || die "could not set up Python. Check your internet connection and run this again."
 "$BASE/venv/bin/python" -c "import tkinter, psutil, huggingface_hub" \
   || die "the private Python was created but is missing the Tk window toolkit."
+"$BASE/venv/bin/python" -c "import tkinter,sys; sys.exit(0 if tkinter.Tcl().call('info','patchlevel').startswith('8.6') else 1)" \
+  || die "the private Python has the wrong Tk version (need 8.6)."
 info "Python ready"
 
 # ---- 3. oMLX (the model server) ----------------------------------------------------------------
