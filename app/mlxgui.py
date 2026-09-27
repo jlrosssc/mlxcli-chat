@@ -389,12 +389,31 @@ class ChatWindow(QMainWindow):
 
     # ---- transcript rendering ----
 
+    # All programmatic inserts below use a fresh QTextCursor(document), never self.chat.textCursor()
+    # (the widget's own, visible/interactive cursor). Two real bugs came from that originally: (1)
+    # every insert called ensureCursorVisible(), which snaps the view to the bottom unconditionally --
+    # so scrolling up to read or select an earlier reply got undone by the next unrelated append (even
+    # just sending a new message), which is exactly what "can't scroll" looks like from the outside;
+    # (2) reassigning the widget's own cursor on every streamed token also hijacked any text the user
+    # was actively selecting. Scrolling is now a plain, conditional scrollbar move -- it never touches
+    # the user's own cursor/selection, and only follows new content if the user was already at the
+    # bottom (the common case), never yanking them back down from a manual scroll.
+
+    def _at_bottom(self):
+        sb = self.chat.verticalScrollBar()
+        return sb.value() >= sb.maximum() - 4
+
+    def _scroll_to_bottom(self):
+        sb = self.chat.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def _append_html_block(self, html_block):
-        cursor = self.chat.textCursor()
+        was_at_bottom = self._at_bottom()
+        cursor = QTextCursor(self.chat.document())
         cursor.movePosition(QTextCursor.End)
         cursor.insertHtml(html_block)
-        self.chat.setTextCursor(cursor)
-        self.chat.ensureCursorVisible()
+        if was_at_bottom:
+            self._scroll_to_bottom()
 
     def append_user_message(self, text):
         safe = html.escape(text).replace("\n", "<br>")
@@ -410,30 +429,33 @@ class ChatWindow(QMainWindow):
 
     def start_assistant_block(self):
         self._append_html_block('<div style="color:#7a7a73;font-size:13px;margin-top:8px;">Assistant</div>')
-        cursor = self.chat.textCursor()
+        cursor = QTextCursor(self.chat.document())
         cursor.movePosition(QTextCursor.End)
         self._assistant_pos = cursor.position()
         self._assistant_raw = ""
 
     def append_assistant_chunk(self, piece):
         self._assistant_raw += piece
-        cursor = self.chat.textCursor()
+        was_at_bottom = self._at_bottom()
+        cursor = QTextCursor(self.chat.document())
         cursor.movePosition(QTextCursor.End)
         cursor.insertText(piece)
-        self.chat.setTextCursor(cursor)
-        self.chat.ensureCursorVisible()
+        if was_at_bottom:
+            self._scroll_to_bottom()
 
     def finalize_assistant_block(self):
         if self._assistant_pos is None or not self._assistant_raw:
             self._assistant_pos = None
             return
-        cursor = self.chat.textCursor()
+        was_at_bottom = self._at_bottom()
+        cursor = QTextCursor(self.chat.document())
         cursor.setPosition(self._assistant_pos)
         cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
         cursor.removeSelectedText()
         rendered = markdown_to_qt_html(self._assistant_raw)
         cursor.insertHtml(f'<div style="background:#f7f7f5;padding:8px 12px;">{rendered}</div>')
-        self.chat.ensureCursorVisible()
+        if was_at_bottom:
+            self._scroll_to_bottom()
         self._assistant_pos = None
         self._assistant_raw = ""
 
