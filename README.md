@@ -55,6 +55,8 @@ If a download is interrupted, just run the installer again. It picks up where it
 
 Options: `--models gemma` or `--models qwen` (download only one, saves about 8 GB), `--skip-omlx`, `--no-desktop`, `--yes`.
 
+The private Python (step 2) comes from Anaconda's package channel, which is free for personal use and small organizations; larger organizations need a paid plan (see [anaconda.com/pricing](https://www.anaconda.com/pricing)). Nothing else here depends on Anaconda, and this is the only step that does.
+
 ## Update
 
 To get the latest fixes, run the installer again. It keeps oMLX and your downloaded models, and finishes in about a minute:

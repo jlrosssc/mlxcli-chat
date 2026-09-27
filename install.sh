@@ -85,8 +85,13 @@ cp "$SRC/assets/AppIcon.icns" "$BASE/AppIcon.icns"
 info "$BASE/app"
 
 say "Setting up Python (private copy, ~200 MB)"
-# The chat window needs Tk 8.6. uv's standalone Pythons now ship Tk 9, where typing in the message box misbehaves,
-# so use micromamba + conda-forge instead: no admin rights needed, and nothing touches any Python already on this Mac.
+# The chat window needs Tk 8.6.15 specifically: uv's standalone Pythons ship Tk 9 (typing misbehaves on
+# recent macOS), and conda-forge's newest osx-arm64 build is only 8.6.13 (scrolling/text-selection in the
+# conversation window misbehaves on macOS 26 with that one). 8.6.15, from Anaconda's own "main" channel, is
+# the version this was developed and tested against. No admin rights needed; nothing touches any Python
+# already on this Mac. (Anaconda's main channel is free for personal use and small organizations -- see
+# https://www.anaconda.com/pricing for the terms; conda-forge above remains free for everyone but currently
+# tops out at Tk 8.6.13 on Apple Silicon.)
 MM="$BASE/bin/micromamba"
 if [ ! -x "$MM" ]; then
   mkdir -p "$BASE/bin"
@@ -96,13 +101,13 @@ if [ ! -x "$MM" ]; then
 fi
 export MAMBA_ROOT_PREFIX="$BASE/mamba"
 rm -rf "$BASE/venv"
-"$MM" create -y -q -p "$BASE/venv" -c conda-forge --override-channels \
-  "python=$PYTHON_VERSION" "tk=8.6.*" psutil websockets huggingface_hub \
+"$MM" create -y -q -p "$BASE/venv" -c https://repo.anaconda.com/pkgs/main --override-channels \
+  "python=$PYTHON_VERSION" "tk=8.6.15" psutil websockets huggingface_hub \
   || die "could not set up Python. Check your internet connection and run this again."
 "$BASE/venv/bin/python" -c "import tkinter, psutil, huggingface_hub" \
   || die "the private Python was created but is missing the Tk window toolkit."
-"$BASE/venv/bin/python" -c "import tkinter,sys; sys.exit(0 if tkinter.Tcl().call('info','patchlevel').startswith('8.6') else 1)" \
-  || die "the private Python has the wrong Tk version (need 8.6)."
+"$BASE/venv/bin/python" -c "import tkinter,sys; sys.exit(0 if tkinter.Tcl().call('info','patchlevel')=='8.6.15' else 1)" \
+  || die "the private Python has the wrong Tk version (need 8.6.15)."
 info "Python ready"
 
 # ---- 3. oMLX (the model server) ----------------------------------------------------------------
