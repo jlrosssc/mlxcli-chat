@@ -133,6 +133,10 @@ DEFAULT_SYSTEM = (
     "actually present. If required input is missing, say exactly what is missing instead of guessing.\n"
     "When a request names a category or target (e.g. 'my photos', 'my documents', 'my files') without stating "
     "where it lives, ask which folder or path to use.\n"
+    "You have a web_search tool that reaches the real internet, with the user's approval before each search. "
+    "Never tell the user you lack internet access or cannot browse the web -- if you already know the answer, "
+    "just answer; if the request needs current, external, or verifiable information, call web_search instead "
+    "of claiming you can't.\n"
 )
 
 
