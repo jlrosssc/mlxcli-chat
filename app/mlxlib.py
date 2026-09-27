@@ -2099,25 +2099,6 @@ def fast_lane_complete(url, key, model, backend, messages, user):
     return text, tin, tout, problems
 
 
-DEFAULT_MODEL_PREF_PATH = pathlib.Path.home() / ".omlx" / "default_model.txt"
-
-
-def prefer_default_model(ids):
-    """Move the user's preferred model (a name fragment saved in ~/.omlx/default_model.txt, written by the
-    mlxcli-chat installer) to the front of a model list so it is what a fresh session selects. No file, or no
-    match, leaves the server's order untouched."""
-    try:
-        want = DEFAULT_MODEL_PREF_PATH.read_text().strip().lower()
-    except OSError:
-        return ids
-    if not want:
-        return ids
-    for i, mid in enumerate(ids):
-        if want in mid.lower():
-            return [mid] + ids[:i] + ids[i + 1:]
-    return ids
-
-
 def drop_orphan_tool_messages(messages):
     """Remove `tool` messages that don't answer an earlier, still-unanswered assistant tool call.
 
@@ -2138,3 +2119,22 @@ def drop_orphan_tool_messages(messages):
             resolved.add(tid)
         out.append(m)
     return out
+
+
+DEFAULT_MODEL_PREF_PATH = pathlib.Path.home() / ".omlx" / "default_model.txt"
+
+
+def prefer_default_model(ids):
+    """Move the user's preferred model (a name fragment saved in ~/.omlx/default_model.txt, written by the
+    mlxcli-chat installer) to the front of a model list so it is what a fresh session selects. No file, or no
+    match, leaves the server's order untouched."""
+    try:
+        want = DEFAULT_MODEL_PREF_PATH.read_text().strip().lower()
+    except OSError:
+        return ids
+    if not want:
+        return ids
+    for i, mid in enumerate(ids):
+        if want in mid.lower():
+            return [mid] + ids[:i] + ids[i + 1:]
+    return ids
