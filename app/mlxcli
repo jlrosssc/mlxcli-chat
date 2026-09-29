@@ -125,8 +125,9 @@ from mlxlib import (
     is_code_request, requires_agentic_execution, should_auto_enable_agentic,
     execution_contract, tool_result_failed, resolve_output_path,
     normalize_tool_name, infer_command_cwd,
-    is_destructive_command, has_override_intent, has_clarify_intent, CLARIFY_MODE_SYSTEM_NOTE,
-    repair_truncated_json,
+    is_destructive_command, has_override_intent, has_clarify_intent, CLARIFY_MODE_SYSTEM_NOTE, CLARIFY_AUTO_SYSTEM_NOTE,
+    repair_truncated_json, read_text_window, clip_output,
+    compact_turn_messages, python_code_writes_files,
     python_syntax_error, missing_local_imports,
     find_entry_point_candidates, smoke_test_python_app, run_verify_command, run_verify_suite,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
@@ -815,8 +816,26 @@ def request_messages_for_mode(messages, agentic_mode, backend, clarify_mode=Fals
         scoped.insert(insert_at, {"role": "system", "content": (
             "Agentic mode is disabled. Do not attempt tool use; answer only from the provided conversation context."
         )})
+    if agentic_mode and SANDBOX_MODE:
+        # The model was never told this, and the default system prompt even says ~/Library/CloudStorage is
+        # reachable "with your existing tools" -- so it ran ls/find/launchctl against ~/Library in the sandbox,
+        # read the empty results as facts about the Mac, and "installed" files that never left the container.
+        root = load_default_dir().resolve()
+        scoped.insert(insert_at + 1, {"role": "system", "content": (
+            f"Sandbox: run_command and python_interpreter run in an isolated Linux container that contains ONLY "
+            f"{root} (mounted as /workspace). They cannot see or change anything else on the user's Mac -- not "
+            f"~/Library (LaunchAgents, CloudStorage, Application Support), not other folders, and macOS tools like "
+            f"launchctl, crontab, defaults or brew do not exist there. Empty or 'not found' output about such "
+            f"places means nothing. read_file reads any path on the Mac directly, so use it for host files outside "
+            f"{root}. write_file outside {root} does not reach the Mac. If a task needs to change or run something "
+            f"outside {root}, do the part you can inside {root}, then tell the user plainly what you could not do "
+            f"and give the exact Terminal commands for it -- never say it is done."
+        )})
     if clarify_mode:
-        scoped.insert(insert_at + 1, {"role": "system", "content": CLARIFY_MODE_SYSTEM_NOTE})
+        # "auto" = switched on by mlxcli for an interactive agentic turn; anything else
+        # truthy = the user's own message asked for it (has_clarify_intent).
+        note = CLARIFY_AUTO_SYSTEM_NOTE if clarify_mode == "auto" else CLARIFY_MODE_SYSTEM_NOTE
+        scoped.insert(insert_at + 1, {"role": "system", "content": note})
     if is_turbo_backend(backend):
         scoped = collapse_system_messages(scoped)
     return scoped
@@ -1261,6 +1280,55 @@ def sandbox_container_path(target):
         return str(target)
 
 
+# Tools that only exist on (or only mean anything on) macOS. Inside the Linux
+# sandbox they're missing or see an empty system, so their output says nothing
+# about the user's Mac, and anything they "change" never happens.
+_MAC_ONLY_COMMANDS = ("launchctl", "osascript", "defaults", "pmset", "scutil", "networksetup", "diskutil",
+                      "sw_vers", "system_profiler", "mdfind", "mdls", "plutil", "security", "softwareupdate",
+                      "brew", "crontab", "caffeinate", "tmutil", "dscl", "log show", "log stream")
+# Container-side paths whose contents are the container's own, not the host's.
+_SANDBOX_LOCAL_PREFIXES = ("/dev", "/tmp", "/workspace", "/proc", "/usr", "/bin", "/sbin", "/lib", "/sys", "/run")
+SANDBOX_HOST_MARKER = "[SANDBOX: NOT ON THE MAC]"
+
+
+def sandbox_host_targets(text):
+    """Host things a sandboxed command/program referenced that the sandbox can't
+    actually reach: paths on the Mac outside the mounted working directory, and
+    Mac-only tools. Found 2026-09-28: the old note only fired on a non-zero exit,
+    so `ls ~/Library/LaunchAgents 2>/dev/null || echo none`, `cp x ~/Library/...`
+    and `launchctl load ...` all "succeeded" in the container -- the model
+    reported a loaded job as missing, then claimed it had installed a plist that
+    never reached the Mac, and the harness printed "(verified tool actions
+    completed)" over both."""
+    root = load_default_dir().resolve()
+    found = []
+    for m_ in re.finditer(r"(?<![\w/.])(~?/[^\s'\";|&<>()]+)", text or ""):
+        raw = m_.group(1)
+        try:
+            hp = pathlib.Path(raw).expanduser()
+            if str(hp).startswith(_SANDBOX_LOCAL_PREFIXES) or hp.resolve().is_relative_to(root):
+                continue
+            # The path itself, or (for something about to be created) its parent, is real on the Mac.
+            if (hp.exists() or hp.parent.exists()) and raw not in found:
+                found.append(raw)
+        except (OSError, ValueError):
+            pass
+    for tool in _MAC_ONLY_COMMANDS:
+        if re.search(r"(?<![\w./-])" + re.escape(tool) + r"(?![\w.-])", text or "") and tool not in found:
+            found.append(tool)
+    return found
+
+
+def sandbox_host_note(targets):
+    root = load_default_dir().resolve()
+    return ("\n" + SANDBOX_HOST_MARKER + " Error: this ran in an isolated Linux sandbox that only contains "
+            f"{root} (as /workspace), NOT on the user's Mac. It could not see or change: {', '.join(targets[:5])}. "
+            "Its output is NOT evidence about those on the Mac (empty/missing/'not found' means nothing), and any "
+            "change it made to them did NOT happen. Do not report them as found, missing, done, installed or loaded. "
+            "Use read_file for host files outside the working directory; for anything else, tell the user plainly "
+            "it could not be checked or done from the sandbox and give them the exact command to run themselves.")
+
+
 def sandbox_rewrite_command(cmd):
     """Rewrite host absolute-path references to the working directory inside
     a shell command string so they resolve inside the container. The model's
@@ -1448,7 +1516,7 @@ def exec_tool(name, args, current_user_text=None):
             if not approve(f"ssh run {host}: {cmd}", category="ssh_run"):
                 return "User declined."
             code, output = run_ssh_command(host, cmd)
-            return f"exit_code={code}\n{output[:MAX_FILE_CHARS] if output else '(no output)'}"
+            return f"exit_code={code}\n{clip_output(output) if output else '(no output)'}"
         if name == "read_file":
             path = args.get("path", "")
             print(f"  tool: read_file [remote:{host}] ({path})")
@@ -1489,36 +1557,25 @@ def exec_tool(name, args, current_user_text=None):
                 p = subprocess.run(["container", "exec", SANDBOX_CONTAINER_NAME, "sh", "-c", sandboxed_cmd],
                                    capture_output=True, text=True, timeout=180)
                 location = "\nworking_directory=/workspace (sandboxed)"
-                # The sandbox only sees the working directory. A host path outside it fails with "No such file or
-                # directory" even though it exists, and the model then tells the user the file does not exist.
-                if p.returncode != 0:
-                    root = load_default_dir().resolve()
-                    hidden = []
-                    for m_ in re.finditer(r"(?<![\w/.])(~?/[^\s'\";|&<>()]+)", cmd):
-                        try:
-                            hp = pathlib.Path(m_.group(1)).expanduser()
-                            if hp.exists() and not hp.resolve().is_relative_to(root) and str(hp) not in hidden:
-                                hidden.append(str(hp))
-                        except (OSError, ValueError):
-                            pass
-                    if hidden:
-                        location += ("\n[sandbox note: " + ", ".join(hidden[:3]) + " exist(s) on the host, but this sandbox can only see "
-                                     f"{root} (mounted as /workspace), so a 'No such file' error here does NOT mean the file is missing. "
-                                     "Do not tell the user it does not exist: read it with read_file (host access), or say it needs an "
-                                     "unsandboxed run (the user can start mlxcli with --ask).]")
+                # Flag host targets whatever the exit code: a command that "succeeds" in the
+                # sandbox (empty listing, cp into the container's own ~/Library) is just as
+                # much not-about-the-Mac as one that fails.
+                host_targets = sandbox_host_targets(cmd)
+                if host_targets:
+                    location += sandbox_host_note(host_targets)
             else:
                 cwd = infer_command_cwd(cmd)
                 p = subprocess.run(cmd, shell=True, capture_output=True,
                                    text=True, timeout=180, cwd=cwd)
                 location = f"\nworking_directory={cwd}" if cwd else ""
             out = (p.stdout + p.stderr).strip()
-            return f"exit_code={p.returncode}{location}\n{out[:MAX_FILE_CHARS] if out else '(no output)'}"
+            return f"exit_code={p.returncode}{location}\n{clip_output(out) if out else '(no output)'}"
         except subprocess.TimeoutExpired:
             return "Command timed out."
     if name == "python_interpreter":
         code = args.get("code", "")
         print("  tool: python_interpreter")
-        if any(term in code for term in ("open(", "write_text(", "makedirs(", "mkdir(", "os.remove(", "unlink(")):
+        if python_code_writes_files(code):
             return "Error: use write_file for file creation and run_command for execution; python_interpreter is disabled for filesystem writes."
         if not approve(f"run Python code ({len(code)} chars)", category="python_interpreter"):
             return "User declined."
@@ -1529,11 +1586,14 @@ def exec_tool(name, args, current_user_text=None):
                 sandboxed_code = sandbox_rewrite_command(code)
                 p = subprocess.run(["container", "exec", SANDBOX_CONTAINER_NAME, "python3", "-c", sandboxed_code],
                                    capture_output=True, text=True, timeout=180)
+                host_targets = sandbox_host_targets(code)
+                note = sandbox_host_note(host_targets) if host_targets else ""
             else:
                 p = subprocess.run([sys.executable, "-c", code], capture_output=True,
                                    text=True, timeout=180)
+                note = ""
             out = (p.stdout + p.stderr).strip()
-            return f"exit_code={p.returncode}\n{out[:MAX_FILE_CHARS] if out else '(no output)'}"
+            return f"exit_code={p.returncode}{note}\n{clip_output(out) if out else '(no output)'}"
         except subprocess.TimeoutExpired:
             return "Python execution timed out."
     if name == "ssh_run":
@@ -1723,15 +1783,14 @@ def exec_tool(name, args, current_user_text=None):
         return answer if answer else "The user gave no answer. Proceed using your own best judgment instead."
     if name == "read_file":
         print(f"  tool: read_file ({args.get('path', '')})")
-        target = pathlib.Path(args["path"]).expanduser()
+        target = pathlib.Path(args.get("path", "")).expanduser()
         if target.is_dir():
             return (f"Error: {target} is a directory, not a file. "
                     f"Use run_command with 'ls' or 'find' to see its contents.")
         try:
             text = target.read_text()
-            note = "" if len(text) <= MAX_FILE_CHARS else "\n[truncated]"
             print(f"  read: {args['path']} ({len(text)} chars)")
-            return text[:MAX_FILE_CHARS] + note
+            return read_text_window(text, args)
         except Exception as e:
             return f"Error: {e}"
     if name == "write_file":
@@ -1787,9 +1846,15 @@ def exec_tool(name, args, current_user_text=None):
                      container_path],
                     input=content, capture_output=True, text=True, timeout=60)
                 if p.returncode == 0:
-                    return (f"Written: {container_path} ({p.stdout.strip()} bytes) inside the sandbox only "
-                            f"— this path is outside the working directory, so nothing was written to the "
-                            f"real host filesystem.")
+                    # Must not start with "Written:" -- the turn loop treats that prefix as a real,
+                    # successful write (write contract, artifact tracking), which is how a plist
+                    # "installed" into the sandbox's own ~/Library got reported as done.
+                    return (f"{SANDBOX_HOST_MARKER} Error: NOT written to the Mac. {target} is outside the "
+                            f"working directory, so it only went to {container_path} inside the throwaway "
+                            f"sandbox. Nothing on the user's Mac changed. Do not report this file as written or "
+                            f"installed; tell the user it could not be written from the sandbox and give them the "
+                            f"exact content/command to apply it themselves (or write it inside the working "
+                            f"directory and give them the one command that copies it into place).")
                 return f"Error writing inside sandbox: {p.stderr.strip()}"
         backup_path = backup_before_overwrite(target) if diff else None
         try:
@@ -4160,6 +4225,7 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
     stream_error = None
     printed = False
     repetition_detected = False
+    finish_reason = None
     chunks_since_check = 0
     with urllib.request.urlopen(request(url, key, "/v1/chat/completions",
                                         payload), timeout=900) as r:
@@ -4182,6 +4248,7 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
             choices = chunk.get("choices") or []
             if not choices:
                 continue
+            finish_reason = choices[0].get("finish_reason") or finish_reason
             delta = choices[0].get("delta") or {}
             piece = delta.get("content")
             if piece:
@@ -4216,6 +4283,9 @@ def stream_once(url, key, model, messages, agentic_mode, backend, display_conten
         print()
     if repetition_detected:
         print("  (model generation fell into a repetition loop; stopped early)")
+    if finish_reason == "length" and not calls:
+        # Otherwise a reply cut off mid-sentence at max_tokens reads as a complete (if abrupt) answer.
+        print("  (note: this reply hit the model's output-token limit, so it is cut off and incomplete)")
     tool_calls = [{"id": c["id"] or f"call_{i}", "type": "function",
                    "function": {"name": c["name"], "arguments": c["arguments"]}}
                   for i, c in sorted(calls.items())]
@@ -4260,7 +4330,24 @@ def _warn_incomplete_writes(written_paths):
           f"{', '.join(written_paths)})")
 
 
-def chat_turn(url, key, model, messages, totals, agentic_mode, backend, execution_required=False, contract=None):
+def _warn_sandbox_blocked(blocked):
+    """Printed by the harness itself, not left to the model's summary: every
+    tool call this turn that reached for something on the Mac the sandbox
+    can't touch. The model has repeatedly said it installed/changed/checked
+    things on the Mac that only happened (or didn't) inside the container."""
+    if not blocked:
+        return
+    print(f"(warning: {len(blocked)} command(s) this turn targeted your Mac outside the working directory but ran "
+          f"only in the sandbox -- nothing they changed reached your Mac, and what they 'found' says nothing about it. "
+          f"Ignore any claim above that depends on them:)")
+    for item in blocked[:8]:
+        print(f"   - {item}")
+    if len(blocked) > 8:
+        print(f"   - ... and {len(blocked) - 8} more")
+
+
+def chat_turn(url, key, model, messages, totals, agentic_mode, backend, execution_required=False, contract=None,
+              auto_clarify=False):
     # Guard the whole turn (all agentic tool-call retries included, not just
     # one HTTP request) so a long local generation can't get killed by the
     # Mac going to sleep mid-turn. server_busy_guard marks the same span as
@@ -4268,7 +4355,8 @@ def chat_turn(url, key, model, messages, totals, agentic_mode, backend, executio
     # queue) that would otherwise only be able to check whether some mlxcli
     # process merely still exists.
     with caffeinate_guard(), server_busy_guard(on_wait=print):
-        return _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, execution_required, contract)
+        return _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, execution_required, contract,
+                               auto_clarify)
 
 
 def offer_smoke_test(written_py_paths):
@@ -4297,7 +4385,8 @@ def offer_smoke_test(written_py_paths):
         print(f"  [{status}] {path.name}: {message}")
 
 
-def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, execution_required=False, contract=None):
+def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, execution_required=False, contract=None,
+                    auto_clarify=False):
     turn_start = time.time()
     turn_in = 0
     turn_out = 0
@@ -4317,11 +4406,33 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
     original_user_text = next(
         (m.get("content") for m in reversed(messages) if m.get("role") == "user"), "")
     clarify_mode = has_clarify_intent(original_user_text)
+    # Auto clarify only where someone can actually answer: ask_user in a headless
+    # run just returns "no human available", which wastes a model turn.
+    if not clarify_mode and auto_clarify and agentic_mode and sys.stdin.isatty():
+        clarify_mode = "auto"
     # Everything from here on (this turn's own tool_calls/tool-result
     # messages) is fair game for in-turn compaction; nothing before it is
     # ever touched — that's trim()'s job, between turns.
     turn_start_index = len(messages)
     seen_tool_calls = {}
+    # Loop detection, at the level of "did this whole step actually produce anything
+    # new" rather than any one call's cache key -- matching by args (like seen_tool_calls
+    # above) isn't enough: a call like ha_api can vary its args step to step (pagination,
+    # a slightly different query) while still returning the exact same underlying dump
+    # every time, so an args-keyed cache never even sees it as a repeat. Comparing the
+    # actual concatenated result text of consecutive steps catches that regardless of
+    # which tool was called or whether its args matched. Two seen 2026-09-28: ~30+
+    # identical ls/find/grep steps (empty match every time) that a per-call cache
+    # wouldn't dedupe since run_command/python_interpreter are deliberately never cached
+    # (state can legitimately change between identical-looking calls); then, separately,
+    # dozens of ha_api calls each burning a full model turn to re-fetch an unchanged
+    # ~30K-character state dump. Both ran unchecked until MAX_TOOL_STEPS or a human
+    # Ctrl-C, because the existing repeated-FAILURE guard below only fires for a cached
+    # call whose reused result was a failure -- these all "succeeded" every time.
+    recent_step_blobs = []   # the last two steps' result text; also catches an A,B,A,B alternation
+    stuck_repeat_streak = 0
+    sandbox_blocked = []
+    sandbox_nudged = False
     effective_agentic_mode = agentic_mode
     retried_with_tools = False
     for _ in range(MAX_TOOL_STEPS):
@@ -4391,6 +4502,32 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                     print(f"  [thinking] {content}")
                 continue
             unmet = [name for name, required in contract.items() if required and not tool_state.get(name)]
+            if execution_required and unmet and sandbox_blocked:
+                # The missing evidence is (at least partly) things the sandbox cannot do on the Mac.
+                # Asking again just gets more sandboxed attempts or more "done" claims, so give the
+                # model one chance to tell the user plainly, then stop and show its answer with the
+                # harness's own warning.
+                if not sandbox_nudged and _ < MAX_TOOL_STEPS - 1:
+                    sandbox_nudged = True
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({"role": "user", "content": (
+                        "Do not claim completion. Some required actions targeted the Mac outside the working "
+                        "directory and only ran in the sandbox, so they did NOT happen on the Mac. Do not retry "
+                        "them in the sandbox. Reply to the user now: say clearly which parts were NOT done, "
+                        "and give the exact commands for them to run in Terminal to finish it."
+                    )})
+                    print("(some required actions could not reach your Mac from the sandbox; asking the model "
+                          "to say so plainly)")
+                    continue
+                print(f"(NOT done on your Mac: {', '.join(unmet)} -- see warning below)")
+                if content:
+                    print(content)
+                messages.append({"role": "assistant", "content": content})
+                _warn_sandbox_blocked(sandbox_blocked)
+                totals["in"] += turn_in
+                totals["out"] += turn_out
+                print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
+                return turn_in, turn_out
             if execution_required and unmet:
                 if _ < MAX_TOOL_STEPS - 1:
                     messages.append({"role": "assistant", "content": content})
@@ -4403,9 +4540,11 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                         print(f"  [thinking] {content}")
                     continue
                 print(f"(unverified: missing tool evidence for {', '.join(unmet)})")
+                _warn_sandbox_blocked(sandbox_blocked)
                 return turn_in, turn_out
             if execution_required:
-                print("(verified tool actions completed)")
+                print("(tool actions completed, but some never reached your Mac -- see warning below)"
+                      if sandbox_blocked else "(verified tool actions completed)")
                 if content:
                     print(content)
             fix_made_last_pass = len(written_paths) > written_count_before_review
@@ -4438,6 +4577,7 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                       else "(confirming the fix before finishing...)")
                 continue
             offer_smoke_test(written_py_paths)
+            _warn_sandbox_blocked(sandbox_blocked)
             messages.append({"role": "assistant", "content": content})
             totals["in"] += turn_in
             totals["out"] += turn_out
@@ -4448,6 +4588,7 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
         if SHOW_THINKING and content:
             print(f"  [thinking] {content}")
         repeated_failure = False
+        this_step_results = []
         for call in tool_calls:
             fn = normalize_tool_name(call["function"]["name"])
             call["function"]["name"] = fn
@@ -4501,6 +4642,10 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
                     log_error("exec_tool", f"{fn} raised {type(exc).__name__}: {exc}")
                 if cacheable:
                     seen_tool_calls[call_key] = result
+            this_step_results.append(result)
+            if SANDBOX_HOST_MARKER in (result or ""):
+                what = args.get("command") if isinstance(args, dict) and fn == "run_command" else fn
+                sandbox_blocked.append(str(what)[:160])
             command_looks_like_write = fn == "run_command" and re.search(
                 r'(^|[;&|])\s*\S.*(>>?|\btee\b)\s+\S', args.get("command", "") if isinstance(args, dict) else "")
             if fn in ("ssh_write",) and not tool_result_failed(result):
@@ -4556,6 +4701,19 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
             log_error("chat_turn", f"stopped: repeated already-failed tool call (backend={backend}, model={model})")
             print("(stopped: the model repeated an already-failed tool call instead of adapting)")
             _warn_incomplete_writes(written_paths)
+            _warn_sandbox_blocked(sandbox_blocked)
+            totals["in"] += turn_in
+            totals["out"] += turn_out
+            print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
+            return turn_in, turn_out
+        this_step_blob = "\x00".join(this_step_results)
+        stuck_repeat_streak = stuck_repeat_streak + 1 if this_step_blob in recent_step_blobs else 0
+        recent_step_blobs = (recent_step_blobs + [this_step_blob])[-2:]
+        if stuck_repeat_streak >= 2:
+            log_error("chat_turn", f"stopped: repeated the same tool call(s) with no new result twice in a row (backend={backend}, model={model})")
+            print("(stopped: the model repeated the exact same tool call(s) with no new information twice in a row instead of concluding; try narrowing the request or answering directly)")
+            _warn_incomplete_writes(written_paths)
+            _warn_sandbox_blocked(sandbox_blocked)
             totals["in"] += turn_in
             totals["out"] += turn_out
             print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
@@ -4563,6 +4721,7 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
     log_error("chat_turn", f"stopped: too many tool steps (backend={backend}, model={model})")
     print("(stopped: too many tool steps — break the task into smaller pieces)")
     _warn_incomplete_writes(written_paths)
+    _warn_sandbox_blocked(sandbox_blocked)
     totals["in"] += turn_in
     totals["out"] += turn_out
     print_tokens("turn", turn_in, turn_out, elapsed=time.time() - turn_start)
@@ -4664,68 +4823,7 @@ KEEP_RECENT_TOOL_ROUNDS = 4
 COMPACT_MIN_CHARS = 300
 
 
-def compact_turn_messages(messages, turn_start_index, keep_recent_rounds=KEEP_RECENT_TOOL_ROUNDS):
-    """FIFO-compress older tool interactions within the CURRENT turn only.
-
-    Never touches messages before turn_start_index (prior-turn history is
-    trim()'s job, between turns). Within this turn, replaces the bulky
-    content of tool calls/results older than the most recent
-    keep_recent_rounds with a short marker, preserving the record that the
-    action happened (so the model doesn't re-do it — the separate
-    seen_tool_calls dedup cache also guards against that independently)
-    without carrying its full payload. Compresses, does not delete: message
-    order and count are unchanged. Returns (messages, chars_saved).
-    """
-    unit_starts = [
-        i for i in range(turn_start_index, len(messages))
-        if messages[i].get("role") == "assistant" and messages[i].get("tool_calls")
-    ]
-    if len(unit_starts) <= keep_recent_rounds:
-        return messages, 0
-
-    to_compact_starts = unit_starts[:-keep_recent_rounds]
-    chars_saved = 0
-    new_messages = list(messages)
-
-    for start in to_compact_starts:
-        assistant_msg = new_messages[start]
-        tool_call_ids = {tc.get("id") for tc in (assistant_msg.get("tool_calls") or [])}
-
-        compacted_calls = []
-        assistant_changed = False
-        for tc in assistant_msg.get("tool_calls") or []:
-            args_str = tc.get("function", {}).get("arguments") or ""
-            if len(args_str) > COMPACT_MIN_CHARS and '"__compacted__"' not in args_str:
-                tc = copy.deepcopy(tc)
-                fn_name = tc.get("function", {}).get("name", "?")
-                tc["function"]["arguments"] = json.dumps({
-                    "__compacted__": True,
-                    "fn": fn_name,
-                    "note": f"{len(args_str):,} chars omitted — already applied earlier this turn",
-                })
-                chars_saved += len(args_str) - len(tc["function"]["arguments"])
-                assistant_changed = True
-            compacted_calls.append(tc)
-        if assistant_changed:
-            assistant_msg = dict(assistant_msg)
-            assistant_msg["tool_calls"] = compacted_calls
-            new_messages[start] = assistant_msg
-
-        for i in range(start + 1, len(new_messages)):
-            m = new_messages[i]
-            if m.get("role") != "tool":
-                break  # end of this unit's tool results
-            if m.get("tool_call_id") not in tool_call_ids:
-                continue
-            content = m.get("content") or ""
-            if len(content) > COMPACT_MIN_CHARS and not content.startswith("[compacted:"):
-                marker = f"[compacted: {len(content):,} chars omitted — already applied earlier this turn]"
-                new_m = dict(m)
-                new_m["content"] = marker
-                new_messages[i] = new_m
-                chars_saved += len(content) - len(marker)
-
-    return new_messages, chars_saved
+# COMPACT_EXCERPT_CHARS, _compacted_result and compact_turn_messages live in mlxlib (shared with mlxgui).
 
 
 def commands_only_from_help():
@@ -6042,6 +6140,7 @@ def main():
                     url, key, model, messages, totals, turn_mode, backend,
                     execution_required=requires_agentic_execution(user),
                     contract=execution_contract(user),
+                    auto_clarify=True,
                 )
                 last_turn = {"in": turn_in, "out": turn_out}
                 if pending_export_path:
@@ -6125,6 +6224,7 @@ def main():
                 url, key, model, messages, totals, request_agentic_mode, backend,
                 execution_required=requires_agentic_execution(user),
                 contract=execution_contract(user),
+                auto_clarify=True,
             )
             last_turn = {"in": turn_in, "out": turn_out}
             if pending_export_path:

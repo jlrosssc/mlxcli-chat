@@ -63,6 +63,7 @@ class InputBox(QPlainTextEdit):
             return
         super().keyPressEvent(event)
 
+import mlxlib as _ml
 from mlxlib import (
     load_default_dir, MAX_FILE_CHARS, MAX_TOOL_STEPS, MAX_HISTORY_TURNS, MAX_CONTEXT_CHARS,
     all_tool_schemas, plugin_tools, is_code_request,
@@ -570,20 +571,20 @@ class ChatWindow(QMainWindow):
             try:
                 cwd = infer_command_cwd(command)
                 proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=180, cwd=cwd)
-                output = (proc.stdout + proc.stderr).strip()[:MAX_FILE_CHARS]
+                output = _ml.clip_output((proc.stdout + proc.stderr).strip())
                 location = f"\nworking_directory={cwd}" if cwd else ""
                 return f"exit_code={proc.returncode}{location}\n{output or '(no output)'}"
             except subprocess.TimeoutExpired:
                 return "Command timed out."
         if name == "python_interpreter":
             code = args.get("code", "")
-            if any(t in code for t in ("open(", "write_text(", "makedirs(", "mkdir(", "os.remove(", "unlink(")):
+            if _ml.python_code_writes_files(code):
                 return "Error: use write_file for file creation and run_command for execution; python_interpreter is disabled for filesystem writes."
             if not self.request_tool_approval(f"Run Python code ({len(code)} chars)"):
                 return "User declined."
             try:
                 proc = subprocess.run(["python3", "-c", code], capture_output=True, text=True, timeout=180)
-                output = (proc.stdout + proc.stderr).strip()[:MAX_FILE_CHARS]
+                output = _ml.clip_output((proc.stdout + proc.stderr).strip())
                 return f"exit_code={proc.returncode}\n{output or '(no output)'}"
             except subprocess.TimeoutExpired:
                 return "Python execution timed out."
@@ -592,8 +593,7 @@ class ChatWindow(QMainWindow):
             if path.is_dir():
                 return f"Error: {path} is a directory, not a file. Use run_command with 'ls' or 'find' to see its contents."
             try:
-                text = path.read_text(errors="replace")
-                return text[:MAX_FILE_CHARS] + ("\n[truncated]" if len(text) > MAX_FILE_CHARS else "")
+                return _ml.read_text_window(path.read_text(errors="replace"), args)
             except Exception as exc:
                 return f"Error: {exc}"
         if name == "write_file":
@@ -738,6 +738,11 @@ class ChatWindow(QMainWindow):
                 working_messages.insert(0, {"role": "system", "content": agentic_note})
         effective_agentic = agentic
         model_settings = load_model_settings(self.backend)
+        # Same guards as mlxcli's turn loop: stop when two steps in a row (or A,B,A,B) return nothing new,
+        # and shrink older tool results once the prompt nears the server's context window.
+        turn_start_index = len(working_messages)
+        recent_step_blobs = []
+        stuck_repeat_streak = 0
         for _step in range(MAX_TOOL_STEPS):
             payload = {
                 "model": model, "messages": working_messages,
@@ -750,6 +755,7 @@ class ChatWindow(QMainWindow):
             if payload["model"].endswith("-fast"):
                 payload["model"] = payload["model"][:-len("-fast")]
             parts, calls, usage = [], {}, {}
+            finish_reason = None
             stream_error = None
             try:
                 with urllib.request.urlopen(request(self.url, self.key, "/v1/chat/completions", payload), timeout=900) as resp:
@@ -775,6 +781,7 @@ class ChatWindow(QMainWindow):
                         choices = chunk.get("choices") or []
                         if not choices:
                             continue
+                        finish_reason = choices[0].get("finish_reason") or finish_reason
                         delta = choices[0].get("delta") or {}
                         piece = delta.get("content")
                         if piece:
@@ -809,6 +816,11 @@ class ChatWindow(QMainWindow):
                     self.events.put(("status", "Server rejected an unexpected tool call; retrying with tools enabled"))
                     continue
                 self.events.put(("append", f"\n[server error mid-generation: {stream_error}]\n"))
+            prompt_tokens = (usage or {}).get("prompt_tokens") or (usage or {}).get("input_tokens") or 0
+            if prompt_tokens >= _ml.SERVER_MAX_CONTEXT_TOKENS * 0.75:
+                working_messages, chars_saved = _ml.compact_turn_messages(working_messages, turn_start_index)
+                if chars_saved:
+                    self.events.put(("status", f"Context at {prompt_tokens:,} tokens; shrank {chars_saved:,} chars of older tool results"))
             tool_calls = [{"id": slot["id"] or f"gui_call_{index}", "type": "function",
                            "function": {"name": slot["name"], "arguments": slot["arguments"]}}
                           for index, slot in sorted(calls.items())]
@@ -840,6 +852,8 @@ class ChatWindow(QMainWindow):
                     return
                 if effective_agentic and content:
                     self.events.put(("append", content))
+                if finish_reason == "length":
+                    self.events.put(("append", "\n[reply cut off: the model hit its output-token limit, so the answer above is incomplete]\n"))
                 self.events.put(("done", content, usage))
                 return
             clean_content = "" if "call:" in content else content
@@ -847,6 +861,7 @@ class ChatWindow(QMainWindow):
             working_messages.append(assistant_tool_message)
             self.events.put(("tool_history", assistant_tool_message))
             repeated_failure = False
+            this_step_results = []
             for call in tool_calls:
                 call["function"]["name"] = normalize_tool_name(call["function"]["name"])
                 try:
@@ -855,13 +870,18 @@ class ChatWindow(QMainWindow):
                     call_args = {}
                 self.events.put(("status", f"Running tool: {call['function']['name']}"))
                 call_key = (call["function"]["name"], json.dumps(call_args, sort_keys=True, ensure_ascii=False))
-                if call_key in seen_tool_calls:
+                # Never replay run_command/python_interpreter: their result depends on state that legitimately
+                # changes between identical calls ("run the test" after "fix the file").
+                cacheable = call["function"]["name"] not in {"run_command", "python_interpreter"}
+                if cacheable and call_key in seen_tool_calls:
                     result = seen_tool_calls[call_key]
                     if tool_result_failed(result):
                         repeated_failure = True
                 else:
                     result = self.execute_tool(call["function"]["name"], call_args)
-                    seen_tool_calls[call_key] = result
+                    if cacheable:
+                        seen_tool_calls[call_key] = result
+                this_step_results.append(result)
                 if self.cancel_requested:
                     self.events.put(("canceled", content))
                     return
@@ -876,6 +896,14 @@ class ChatWindow(QMainWindow):
                 self.events.put(("tool_history", working_messages[-1]))
             if repeated_failure:
                 self.events.put(("append", "\n[stopped: the model repeated an already-failed tool call]\n"))
+                self.events.put(("done", "", usage))
+                return
+            this_step_blob = "\x00".join(this_step_results)
+            stuck_repeat_streak = stuck_repeat_streak + 1 if this_step_blob in recent_step_blobs else 0
+            recent_step_blobs = (recent_step_blobs + [this_step_blob])[-2:]
+            if stuck_repeat_streak >= 2:
+                self.events.put(("append", "\n[stopped: the model repeated the same tool call(s) with no new information "
+                                           "instead of concluding; try narrowing the request]\n"))
                 self.events.put(("done", "", usage))
                 return
         self.events.put(("append", "\n[stopped: too many tool steps]\n"))

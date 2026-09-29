@@ -13,6 +13,7 @@ mlxgui) since those are fundamentally different interaction models.
 """
 import ast
 import contextlib
+import copy
 import fcntl
 import hashlib
 import importlib.util
@@ -501,9 +502,15 @@ TOOLS = [
             "command": {"type": "string"}}, "required": ["command"]}}},
     {"type": "function", "function": {
         "name": "read_file",
-        "description": "Read a text file (truncated to 8000 chars).",
+        "description": "Read a text file on this Mac (any path, not limited to the sandbox). Returns at most "
+                        "8000 chars; the result says which lines you got and how many the file has. For logs "
+                        "and other files that grow at the end, the newest entries are at the END: use "
+                        "tail_lines to read them. Use start_line to read further into a long file.",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"}}, "required": ["path"]}}},
+            "path": {"type": "string"},
+            "start_line": {"type": "integer", "description": "1-based line to start from (default 1)"},
+            "tail_lines": {"type": "integer", "description": "read only the last N lines instead"}},
+            "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "write_file",
         "description": "Write a new file or overwrite an existing file. Shows the user a preview and asks for approval before writing.",
@@ -618,10 +625,9 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "ask_user",
         "description": "Pause and ask the human a direct clarifying question, then wait for their answer "
-                        "before proceeding. Only call this when the user's own request explicitly invited it "
-                        "(it contained a word or phrase like \"clarify\", \"ask me if unsure\", \"check with me "
-                        "first\", or \"ask before\") -- for an ordinary request, use your own best judgment "
-                        "instead and never call this tool. Even when invited, use it sparingly: only for a "
+                        "before proceeding. Only call this when a system note in this conversation says clarify "
+                        "mode is on -- otherwise use your own best judgment instead and never call this tool. "
+                        "Even when it is on, use it sparingly: only for a "
                         "genuine fork in the road where guessing wrong would produce the wrong outcome (which "
                         "of several plausible interpretations, the exact scope of a destructive or hard-to-"
                         "reverse action, a required detail that's actually missing) -- not for routine "
@@ -757,6 +763,26 @@ CLARIFY_MODE_SYSTEM_NOTE = (
     "tools (writing a file, running a command, etc.) -- that permission is handled "
     "automatically outside this conversation regardless of clarify mode, so never call "
     "ask_user to ask whether you're allowed to do something; just do it."
+)
+
+
+# Auto-enabled counterpart of CLARIFY_MODE_SYSTEM_NOTE: turned on for interactive
+# agentic turns without the user typing a keyword (the user asked for this
+# 2026-09-28, after an "is my scheduled job running?" request with no hint of
+# where to look ran 100+ blind ls/find/API calls without ever asking).
+# Narrower than the keyword version on purpose: its main job is one question up
+# front when the request doesn't say WHERE to look or WHAT exactly to do, before
+# a broad search starts -- not a license to check in on every step.
+CLARIFY_AUTO_SYSTEM_NOTE = (
+    "Clarify mode is on for this request. If the request does not say where the thing it "
+    "asks about lives (which machine, service, file, folder, or config) or leaves a choice "
+    "open that would change what you do, and you cannot settle it with ONE quick, targeted "
+    "check, call ask_user once BEFORE starting a broad search -- a single question like "
+    "\"is this a launchd job, a cron job, or a Home Assistant automation?\" costs the user "
+    "seconds, while dozens of speculative searches cost minutes and fill your context. Give "
+    "concrete options when you can. Ask at most twice per request, one question at a time. "
+    "If the request is already specific enough, do not ask; just proceed. Never use ask_user "
+    "to ask permission to run a tool -- that is handled separately and automatically."
 )
 
 
@@ -953,12 +979,89 @@ def execution_contract(text):
     }
 
 
+def read_text_window(text, args, max_chars=None):
+    """The part of a file read_file returns, with a header saying exactly what was
+    shown. Used to be a bare text[:8000] with a "[truncated]" tail, so a model
+    reading a log (newest entries at the END) only ever saw the oldest ones, with
+    no way to ask for more -- seen 2026-09-28 reporting wrong "last run" times
+    from a 16K-char log whose recent runs were all past the cut."""
+    max_chars = max_chars or MAX_FILE_CHARS
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    tail = _int(args.get("tail_lines"))
+    start = _int(args.get("start_line"))
+    if tail and tail > 0:
+        first = max(total - tail, 0)
+        chunk = lines[first:]
+        # Keep the END when a tail window is still too big.
+        body = "".join(chunk)
+        if len(body) > max_chars:
+            body = body[-max_chars:]
+            first = total - body.count("\n") - (0 if body.endswith("\n") else 1)
+        shown_from, shown_to = first + 1, total
+    else:
+        first = max((start or 1) - 1, 0)
+        body, shown_to = "", first
+        for line in lines[first:]:
+            if len(body) + len(line) > max_chars:
+                break
+            body += line
+            shown_to += 1
+        if not body and first < total:  # a single line longer than the budget
+            body, shown_to = lines[first][:max_chars], first + 1
+        shown_from = first + 1
+    if total == 0:
+        return "[empty file]"
+    if shown_from <= 1 and shown_to >= total:
+        return body
+    more = []
+    if shown_from > 1:
+        more.append(f"lines 1-{shown_from - 1} not shown (start_line={max(shown_from - 200, 1)} to go back)")
+    if shown_to < total:
+        more.append(f"lines {shown_to + 1}-{total} not shown (start_line={shown_to + 1} for the next part, "
+                    f"tail_lines=N for the end)")
+    return (f"[showing lines {shown_from}-{shown_to} of {total}; " + "; ".join(more) + "]\n" + body)
+
+
+def python_code_writes_files(code):
+    """Whether python_interpreter code writes to the filesystem (those must go through write_file).
+    Blocks WRITES only: the old check refused any code containing "open(", so reads like
+    json.load(open(p)) were refused too and the model couldn't analyze a data file in Python."""
+    return bool(re.search(r"""\bopen\([^)]*?(?:,\s*|mode\s*=\s*)['"][^'"]*[wax+]""", code or "")
+                or any(term in (code or "") for term in ("write_text(", "write_bytes(", "makedirs(", "mkdir(",
+                                                         "os.remove(", "unlink(", "rmtree(", "shutil.move(",
+                                                         "shutil.copy", "os.rename(")))
+
+
+def clip_output(out, max_chars=None):
+    """Command output that fits the budget, keeping its head AND tail and saying
+    so. Plain out[:8000] silently dropped the end (a long `find`, a log `cat`, a
+    test run's final summary) with no sign anything was missing."""
+    max_chars = max_chars or MAX_FILE_CHARS
+    if len(out) <= max_chars:
+        return out
+    half = max_chars // 2
+    omitted = len(out) - 2 * half
+    return (out[:half] + f"\n[... {omitted:,} chars of output omitted from the middle; narrow the command "
+            f"(grep, head, tail) if you need that part ...]\n" + out[-half:])
+
+
+_HTTP_FAILURE = re.compile(r"(^|\n)(\[source: [^\]]*\]\s*)?http [45]\d\d from ")
+
+
 def tool_result_failed(result):
     lowered = (result or "").lower()
     match = re.search(r"exit_code=(-?\d+)", lowered)
-    return (match and int(match.group(1)) != 0) or any(
+    return bool((match and int(match.group(1)) != 0) or any(
         term in lowered for term in ("error:", "not found", "timed out", "user declined")
-    )
+    ) or _HTTP_FAILURE.search(lowered))
 
 
 def python_syntax_error(source):
@@ -2138,3 +2241,91 @@ def prefer_default_model(ids):
         if want in mid.lower():
             return [mid] + ids[:i] + ids[i + 1:]
     return ids
+# In-turn context compaction (shared by mlxcli and mlxgui). Tool rounds more recent than
+# KEEP_RECENT_TOOL_ROUNDS are never touched; tool-call arguments shorter than
+# COMPACT_MIN_CHARS aren't worth replacing.
+KEEP_RECENT_TOOL_ROUNDS = 4
+COMPACT_MIN_CHARS = 300
+COMPACT_EXCERPT_CHARS = 500
+
+
+def _compacted_result(content):
+    """An older in-turn tool result, shrunk but not erased: its first and last
+    COMPACT_EXCERPT_CHARS chars under a header. Replacing results with a bare
+    "[compacted: N chars omitted -- already applied earlier this turn]" threw away
+    the evidence itself (a log's contents, a listing), so the model either re-ran
+    the same reads over and over or answered from a fuzzy memory of them (seen
+    2026-09-28: repeated ls/find right after each compaction, and invented log
+    timestamps). None when there's nothing worth shrinking."""
+    if len(content) <= 2 * COMPACT_EXCERPT_CHARS + 600:
+        return None
+    omitted = len(content) - 2 * COMPACT_EXCERPT_CHARS
+    return (f"[compacted to save context: this earlier result was {len(content):,} chars; its first and last "
+            f"{COMPACT_EXCERPT_CHARS} are kept below. Re-run the tool only if you need the omitted middle.]\n"
+            + content[:COMPACT_EXCERPT_CHARS] + f"\n[... {omitted:,} chars omitted ...]\n"
+            + content[-COMPACT_EXCERPT_CHARS:])
+
+
+def compact_turn_messages(messages, turn_start_index, keep_recent_rounds=KEEP_RECENT_TOOL_ROUNDS):
+    """FIFO-compress older tool interactions within the CURRENT turn only.
+
+    Never touches messages before turn_start_index (prior-turn history is
+    trim()'s job, between turns). Within this turn, replaces the bulky
+    content of tool calls/results older than the most recent
+    keep_recent_rounds with a short marker, preserving the record that the
+    action happened (so the model doesn't re-do it — the separate
+    seen_tool_calls dedup cache also guards against that independently)
+    without carrying its full payload. Compresses, does not delete: message
+    order and count are unchanged. Returns (messages, chars_saved).
+    """
+    unit_starts = [
+        i for i in range(turn_start_index, len(messages))
+        if messages[i].get("role") == "assistant" and messages[i].get("tool_calls")
+    ]
+    if len(unit_starts) <= keep_recent_rounds:
+        return messages, 0
+
+    to_compact_starts = unit_starts[:-keep_recent_rounds]
+    chars_saved = 0
+    new_messages = list(messages)
+
+    for start in to_compact_starts:
+        assistant_msg = new_messages[start]
+        tool_call_ids = {tc.get("id") for tc in (assistant_msg.get("tool_calls") or [])}
+
+        compacted_calls = []
+        assistant_changed = False
+        for tc in assistant_msg.get("tool_calls") or []:
+            args_str = tc.get("function", {}).get("arguments") or ""
+            if len(args_str) > COMPACT_MIN_CHARS and '"__compacted__"' not in args_str:
+                tc = copy.deepcopy(tc)
+                fn_name = tc.get("function", {}).get("name", "?")
+                tc["function"]["arguments"] = json.dumps({
+                    "__compacted__": True,
+                    "fn": fn_name,
+                    "note": f"{len(args_str):,} chars omitted — already applied earlier this turn",
+                })
+                chars_saved += len(args_str) - len(tc["function"]["arguments"])
+                assistant_changed = True
+            compacted_calls.append(tc)
+        if assistant_changed:
+            assistant_msg = dict(assistant_msg)
+            assistant_msg["tool_calls"] = compacted_calls
+            new_messages[start] = assistant_msg
+
+        for i in range(start + 1, len(new_messages)):
+            m = new_messages[i]
+            if m.get("role") != "tool":
+                break  # end of this unit's tool results
+            if m.get("tool_call_id") not in tool_call_ids:
+                continue
+            content = m.get("content") or ""
+            if not content.startswith("[compacted"):
+                shrunk = _compacted_result(content)
+                if shrunk is not None:
+                    new_m = dict(m)
+                    new_m["content"] = shrunk
+                    new_messages[i] = new_m
+                    chars_saved += len(content) - len(shrunk)
+
+    return new_messages, chars_saved
