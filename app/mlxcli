@@ -5748,7 +5748,9 @@ def main():
     model = model_arg or (available_models[0] if run_task else pick_model(backend, url, key))
     messages = [{"role": "system", "content": system}]
     # Project/user notes and the last-saved-file reminder are added fresh every turn by
-    # request_messages_for_mode, so they always name the current file.
+    # request_messages_for_mode, so they always name the current file. Looked up here only
+    # for the startup banner and /notes.
+    notes_path, notes_text = find_project_notes()
 
     if run_task:
         # Headless one-shot mode: run a single task non-interactively and exit —
