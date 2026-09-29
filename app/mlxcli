@@ -132,7 +132,7 @@ from mlxlib import (
     repair_truncated_json, read_text_window, clip_output,
     compact_turn_messages, python_code_writes_files,
     seatbelt_available, seatbelt_profile, mac_state_change, SANDBOX_EXEC, validate_written_file, notes_system_text,
-    note_file_known, overwrite_needs_read, compact_call_arguments,
+    note_file_known, overwrite_needs_read, compact_call_arguments, loaded_file_message,
     python_syntax_error, missing_local_imports,
     find_entry_point_candidates, smoke_test_python_app, run_verify_command, run_verify_suite,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
@@ -2384,12 +2384,11 @@ def do_paste(arg, messages, convert_mode, request_text=None):
             text = matched_rows
             label = f"{p.name} (matched cost-center rows)"
     focused = focused_file_text(text, request_text)
-    clipped = focused[:MAX_FILE_CHARS]
     focused_note = " (filtered to requested cost centers)" if focused != text else ""
-    note = "" if len(text) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
-    messages.append({"role": "user",
-                     "content": f"Contents of {label}:\n\n{clipped}"})
-    print(f"(pasted {label}: {len(clipped)} chars into context{focused_note}{note} — now ask about it)")
+    content, display, loaded = loaded_file_message(
+        p, label, focused, extra="; filtered to the rows the request names" if focused_note else "")
+    messages.append({"role": "user", "content": content})
+    print(f"(pasted {display}: {loaded:,} chars into context{focused_note} — now ask about it)")
 
 
 def do_read(arg, messages, convert_mode, request_text=None):
@@ -2553,10 +2552,7 @@ def prompt_for_loaded_files(user_text, labels):
     )
 
 
-def content_message_for_text(label, text):
-    clipped = text[:MAX_FILE_CHARS]
-    note = "" if len(text) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
-    return f"Contents of {label}:\n\n{clipped}", f"{label}{note}", len(clipped)
+# loaded_file_message lives in mlxlib (shared with mlxgui).
 
 
 def load_selected_files(messages, files, convert_mode, limit=8, char_budget=MAX_LOADED_CONTEXT_CHARS):
@@ -2574,7 +2570,7 @@ def load_selected_files(messages, files, convert_mode, limit=8, char_budget=MAX_
         except RuntimeError as e:
             print(f"({path.name}: {e})")
             continue
-        content, display_label, clipped_len = content_message_for_text(label, text)
+        content, display_label, clipped_len = loaded_file_message(path, label, text)
         if labels and loaded_chars + clipped_len > char_budget:
             stopped_for_budget = True
             break
@@ -3498,10 +3494,15 @@ def do_sshread(arg, messages):
     if code != 0:
         print(f"(ssh read failed)\n{output}")
         return
-    clipped = output[:MAX_FILE_CHARS]
-    note = "" if len(output) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
     label = f"{host}:{path}"
-    messages.append({"role": "user", "content": f"Contents of remote file {label}:\n\n{clipped}"})
+    body = read_text_window(output, {})
+    partial = len(output) > MAX_FILE_CHARS
+    hint = (f"\n[Only part of the file is loaded. For more, use ssh_read or ssh_run on {host} "
+            f"(e.g. tail -n 100 {path}).]") if partial else ""
+    messages.append({"role": "user", "content": (
+        f"Contents of remote file {label} (loaded by the user over SSH from {host}, NOT a file on this Mac; "
+        f"{len(output):,} chars):{hint}\n\n{body}")})
+    note = f" [first {min(len(output), MAX_FILE_CHARS):,} of {len(output):,} chars]" if partial else ""
     print(f"(loaded remote file {label} into context{note})")
 
 
@@ -3998,10 +3999,9 @@ def do_review(arg, messages, convert_mode):
 
 def append_loaded_file(messages, path, convert_mode):
     text, label = convert_file(path, convert_mode)
-    clipped = text[:MAX_FILE_CHARS]
-    note = "" if len(text) <= MAX_FILE_CHARS else " [truncated to 8000 chars]"
-    messages.append({"role": "user", "content": f"Contents of {label}:\n\n{clipped}"})
-    return f"{label}{note}"
+    content, display_label, _ = loaded_file_message(path, label, text)
+    messages.append({"role": "user", "content": content})
+    return display_label
 
 
 def do_resumecompare(arg, messages, convert_mode, url, key, model, totals, backend, last_turn):

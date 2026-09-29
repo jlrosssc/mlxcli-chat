@@ -1236,6 +1236,38 @@ def overwrite_needs_read(path):
             f"its CURRENT contents (keep everything the user didn't ask to change).")
 
 
+def loaded_file_message(path, label, text, extra=""):
+    """(message content, display label, chars loaded) for a local file the user loaded into the chat.
+
+    Says where the content came from -- a local file on this Mac, its full path and size -- so the model
+    can tell it apart from text pasted from the web or a remote host, and can go back to the file. Used to
+    be a bare text[:8000] with "[truncated to 8000 chars]", so anything past that was simply gone, with no
+    hint that the rest existed or where to find it."""
+    p = pathlib.Path(path).expanduser().resolve()
+    converted = label != p.name   # e.g. "x.docx (converted to markdown)", filtered xlsx rows
+    lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+    source = f"loaded by the user from the local file {p} on this Mac"
+    if converted:
+        source += f", converted from {p.suffix or 'its original format'} to text"
+    header = f"Contents of {label} ({source}; {len(text):,} chars, {lines:,} lines{extra})"
+    partial = len(text) > MAX_FILE_CHARS
+    if not converted:
+        body = read_text_window(text, {})
+        hint = (f"\n[Only part of the file is loaded. To read more, call read_file with path \"{p}\" and "
+                f"start_line, or tail_lines for the end.]") if partial else ""
+    else:
+        body = text[:MAX_FILE_CHARS]
+        hint = (f"\n[Only the first {MAX_FILE_CHARS:,} of {len(text):,} chars are loaded. read_file can't read "
+                f"the rest of a {p.suffix or 'converted'} file as text: if you need a later part, tell the user "
+                f"which part and ask them to /paste it.]") if partial else ""
+    loaded = min(len(text), MAX_FILE_CHARS)
+    if not converted and not partial and not extra:
+        note_file_known(p)   # the model has seen the whole current file, same as a full read_file
+    display = f"{label} from {p}" + (f" [first {loaded:,} of {len(text):,} chars loaded; the model knows where "
+                                     f"the rest is]" if partial else "")
+    return f"{header}:{hint}\n\n{body}", display, loaded
+
+
 def compact_call_arguments(fn, args_str, note):
     """Replacement arguments for a compacted tool call that still say WHAT it acted on. Dropping the whole
     argument string also dropped the file path, so a few turns later the model no longer knew which
