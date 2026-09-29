@@ -964,6 +964,35 @@ def should_auto_enable_agentic(text, messages=None):
     )
 
 
+# Words that make a following "run"/"test" a noun ("the last run", "a test") and words that make the
+# sentence a question about what already happened ("did it run", "has the job run").
+_RUN_NOUN_BEFORE = {"the", "a", "an", "that", "this", "each", "every", "last", "latest", "previous", "next",
+                    "first", "recent", "hourly", "daily", "nightly", "weekly", "scheduled", "test", "dry", "trial",
+                    "its", "his", "her", "their", "our", "my", "your", "unit", "integration", "smoke"}
+_PAST_QUESTION = {"did", "does", "do", "has", "have", "had", "was", "were", "is", "are", "when", "whether"}
+
+
+def _verb_requested(term, lowered):
+    """Whether `term` ("run", "execute", "test") appears as something the user wants DONE, not a noun or a
+    question about the past. A bare word match made "when did the job last run, and did that run
+    succeed?" demand a run_command, so a question answered by one read_file was forced into four
+    pointless commands and 8 minutes (seen 2026-09-28)."""
+    # Clause by clause (sentence punctuation, "and", "then"), so "what's in the log? run the script" and
+    # "read the file and run it" still count, but a question word anywhere earlier in the same clause
+    # rules it out however long the path in between ("is the script in ~/a/b/c.py run by cron?").
+    for clause in re.split(r"[.?!;,](?=\s|$)|\band\b|\bthen\b", lowered):
+        words = re.findall(r"[a-z0-9_']+", clause)
+        for i, w in enumerate(words):
+            if w != term:
+                continue
+            if (words[i - 1] if i else "") in _RUN_NOUN_BEFORE:
+                continue
+            if any(x in _PAST_QUESTION for x in words[:i]):
+                continue
+            return True
+    return False
+
+
 def execution_contract(text):
     lowered = (text or "").lower()
     # A literal filesystem path is itself an unambiguous target, same as in
@@ -974,7 +1003,7 @@ def execution_contract(text):
     target = has_path_literal or any(term_present(term, lowered) for term in ("file", "files", "directory", "folder", "path", "csv", "script", "downloads"))
     return {
         "write": target and any(term_present(term, lowered) for term in ("create", "write", "save", "generate", "place", "put", "update", "modify", "edit", "add", "change")),
-        "run": target and any(term_present(term, lowered) for term in ("run", "execute", "test")),
+        "run": target and any(_verb_requested(term, lowered) for term in ("run", "execute", "test")),
         "verify": target and any(term_present(term, lowered) for term in ("verify", "inspect", "confirm", "byte size", "exists")),
     }
 

@@ -1199,10 +1199,23 @@ def _apiserver_down(message):
     return any(marker in message for marker in _APISERVER_DOWN_MARKERS)
 
 
+def _host_timezone():
+    """The Mac's time zone name (e.g. America/New_York), so the sandbox's `date`/`stat`/`ls -l` show the
+    user's local time. Without it the container runs on UTC, and the model reported a file modified at
+    9:08 PM EDT as "Sep 29 01:08" with no zone (seen 2026-09-28)."""
+    try:
+        link = os.readlink("/etc/localtime")
+        return link.split("zoneinfo/", 1)[1] if "zoneinfo/" in link else None
+    except OSError:
+        return None
+
+
 def _run_sandbox_container_once(workdir):
+    tz = _host_timezone()
     return subprocess.run(
         ["container", "run", "-d", "--name", SANDBOX_CONTAINER_NAME,
          "-v", f"{workdir}:/workspace", "-w", "/workspace",
+         *(["-e", f"TZ={tz}"] if tz else []),
          SANDBOX_IMAGE, "sleep", "infinity"],
         capture_output=True, text=True, timeout=60)
 
