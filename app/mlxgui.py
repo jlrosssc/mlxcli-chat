@@ -287,9 +287,9 @@ class ChatWindow(QMainWindow):
         self.url, self.key = load_cfg()
         self.system_prompt = load_system_prompt()
         self.messages = [{"role": "system", "content": self.system_prompt}]
-        notes_path, notes_text = find_project_notes()
-        if notes_text:
-            self.messages[0]["content"] += f"\n\nProject notes from {notes_path}:\n\n{notes_text}"
+        notes = _ml.notes_system_text((pathlib.Path.cwd(), load_default_dir()))
+        if notes:
+            self.messages[0]["content"] += f"\n\n{notes}"
         artifact_note = last_artifact_system_note()
         if artifact_note:
             self.messages[0]["content"] += f"\n\n{artifact_note}"
@@ -482,9 +482,9 @@ class ChatWindow(QMainWindow):
 
     def reset_chat_state(self):
         self.messages = [{"role": "system", "content": self.system_prompt}]
-        notes_path, notes_text = find_project_notes()
-        if notes_text:
-            self.messages[0]["content"] += f"\n\nProject notes from {notes_path}:\n\n{notes_text}"
+        notes = _ml.notes_system_text((pathlib.Path.cwd(), load_default_dir()))
+        if notes:
+            self.messages[0]["content"] += f"\n\n{notes}"
         self.totals = {"in": 0, "out": 0}
         self.last_user_text = ""
         self.cancel_requested = False
@@ -616,6 +616,10 @@ class ChatWindow(QMainWindow):
                 record_last_artifact(target, self.last_user_text)
                 note = f" (previous version backed up to {backup_path})" if backup_path else ""
                 result = f"Written: {target} ({target.stat().st_size} bytes).{note}"
+                problem = _ml.validate_written_file(target)
+                if problem:
+                    return (f"{result} Error: the file was written but fails its check -- {problem}. It will not "
+                            f"work as is: fix it with write_file before reporting completion.")
                 if target.suffix == ".py":
                     syntax_error = python_syntax_error(content)
                     if syntax_error:

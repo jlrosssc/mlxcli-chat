@@ -1059,6 +1059,148 @@ def read_text_window(text, args, max_chars=None):
     return (f"[showing lines {shown_from}-{shown_to} of {total}; " + "; ".join(more) + "]\n" + body)
 
 
+# --- macOS Seatbelt sandbox (the default; the Linux `container` sandbox is the fallback) ------------
+# Modeled on Codex CLI: commands can READ anything on the Mac but can only WRITE inside the working
+# folder (plus temp dirs). The container sandbox could only see the working folder, so the model read
+# empty results about ~/Library as facts and "installed" files that never left the container
+# (2026-09-28). With Seatbelt, reads are real and a write outside the folder fails with a real
+# "Operation not permitted".
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+
+def seatbelt_available():
+    return os.path.exists(SANDBOX_EXEC) and os.environ.get("MLXCLI_SANDBOX", "").lower() != "container"
+
+
+def seatbelt_profile(workdir):
+    home = pathlib.Path.home()
+    writable = [pathlib.Path(workdir).resolve(), pathlib.Path("/private/tmp"), pathlib.Path("/private/var/folders"),
+                pathlib.Path("/dev"), home / ".cache"]
+    paths = " ".join('(subpath "%s")' % str(p).replace("\\", "\\\\").replace('"', '\\"') for p in writable)
+    return f"(version 1)(allow default)(deny file-write* (require-not (require-any {paths})))"
+
+
+# Commands that change the Mac's state WITHOUT writing a file, so Seatbelt's write rule can't stop them
+# (verified 2026-09-28: `defaults write` succeeds from inside the sandbox). Refused in the sandbox with
+# an honest "not done" instead.
+_MAC_STATE_CHANGERS = (
+    (r"\bdefaults\s+(-currentHost\s+)?(write|delete|import|rename)\b", "changes macOS settings (defaults write/delete)"),
+    (r"\blaunchctl\s+(load|unload|bootstrap|bootout|kickstart|kill|enable|disable|remove|submit|start|stop|"
+     r"setenv|unsetenv|config|reboot)\b", "loads, unloads or controls launchd jobs"),
+    (r"\bosascript\b", "runs AppleScript, which can control apps and the system"),
+    (r"(^|[;&|(]\s*|\bthen\s+|\bdo\s+)open\s", "opens apps or files in the GUI"),
+    (r"\b(killall|pkill)\b", "kills running processes"),
+    (r"\bbrew\s+(install|uninstall|upgrade|reinstall|remove|rm|services|link|unlink|tap|untap|cleanup|autoremove)\b",
+     "installs or changes Homebrew packages or services"),
+    (r"\bsudo\b", "needs administrator rights"),
+    (r"\b(shutdown|reboot|halt)\b", "shuts down or restarts the Mac"),
+    (r"\bcrontab\b(?!\s+-l\b)", "changes the crontab"),
+    (r"\bpmset\s+(?!-g\b)", "changes power settings"),
+    (r"\b(networksetup\s+-set|scutil\s+--set|systemsetup\s+-set|nvram\s+\w+=|tccutil\s+reset)",
+     "changes system or network settings"),
+    (r"\bdscl\s+\S+\s+-(create|delete|passwd|append|merge)", "changes user accounts"),
+    (r"\bsecurity\s+(add|delete|import|set|unlock|create|remove)", "changes the keychain"),
+    (r"\bsoftwareupdate\s+(-i|--install|-a|--all)", "installs software updates"),
+    (r"\btmutil\s+(delete|enable|disable|start|stop|setdestination|thin|exclude|include)", "changes Time Machine"),
+    (r"\bdiskutil\s+(erase|partition|unmount|mount|eject|rename|apfs|repair)", "changes disks or volumes"),
+)
+
+
+def mac_state_change(cmd):
+    """Why a sandboxed shell command would change Mac state outside the file system, or None."""
+    for pattern, why in _MAC_STATE_CHANGERS:
+        if re.search(pattern, cmd or ""):
+            return why
+    return None
+
+
+# --- Checks run on every file write_file produces (like Aider's auto-lint) --------------------------
+try:
+    import yaml as _yaml
+
+    class _YamlAnyTagLoader(_yaml.SafeLoader):
+        """SafeLoader that accepts app-specific tags (Home Assistant's !include, !secret, ...)."""
+
+    _YamlAnyTagLoader.add_multi_constructor("!", lambda loader, suffix, node: None)
+except ImportError:
+    _yaml = None
+
+
+def validate_written_file(path):
+    """A problem with a file that was just written, as a short message, or None if it checks out (or no
+    checker applies). Catches files that "were written successfully" but won't load: a plist launchd
+    rejects, JSON/YAML that won't parse, a shell script with a syntax error, Python with undefined names."""
+    path = pathlib.Path(path)
+    ext = path.suffix.lower()
+
+    def _run(args):
+        try:
+            p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return None if p.returncode == 0 else ((p.stdout + p.stderr).strip()[:600] or f"exit code {p.returncode}")
+
+    try:
+        if ext == ".plist":
+            problem = _run(["/usr/bin/plutil", "-lint", str(path)]) if os.path.exists("/usr/bin/plutil") else None
+            return f"plutil -lint failed: {problem}" if problem else None
+        if ext == ".json":
+            json.loads(path.read_text())
+            return None
+        if ext in (".yaml", ".yml") and _yaml is not None:
+            _yaml.load(path.read_text(), Loader=_YamlAnyTagLoader)
+            return None
+        if ext == ".toml":
+            import tomllib
+            tomllib.loads(path.read_text())
+            return None
+        if ext in (".sh", ".bash"):
+            problem = _run(["/bin/bash", "-n", str(path)])
+            return f"bash -n (syntax check) failed: {problem}" if problem else None
+        if ext == ".zsh":
+            problem = _run(["/bin/zsh", "-n", str(path)])
+            return f"zsh -n (syntax check) failed: {problem}" if problem else None
+        if ext == ".py" and importlib.util.find_spec("pyflakes"):
+            try:
+                p = subprocess.run([sys.executable, "-m", "pyflakes", str(path)], capture_output=True, text=True,
+                                   timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            # Only real errors: undefined names break at run time; unused imports etc. are just noise.
+            bad = [ln for ln in (p.stdout + p.stderr).splitlines() if "undefined name" in ln]
+            return "pyflakes: " + "; ".join(bad[:5]) if bad else None
+    except Exception as exc:  # parse errors from json/yaml/toml
+        return f"{ext[1:]} does not parse: {str(exc)[:400]}"
+    return None
+
+
+# --- Notes files the model sees every turn (like Codex's AGENTS.md / Gemini CLI's GEMINI.md) ---------
+USER_NOTES_PATH = pathlib.Path.home() / ".omlx" / "notes.md"
+NOTES_MAX_CHARS = 4000
+
+
+def notes_system_text(dirs=()):
+    """Standing notes for the model: the user's own ~/.omlx/notes.md (facts about their setup, e.g. where
+    scheduled jobs live) plus a project notes file (.mlxcli-notes.md / AGENTS.md / CLAUDE.md) from each
+    of `dirs`. Read fresh every call so edits take effect immediately. Empty string when there are none."""
+    parts, seen = [], set()
+    try:
+        text = USER_NOTES_PATH.read_text(errors="replace").strip()
+        if text:
+            parts.append(f"User notes (from {USER_NOTES_PATH}; standing facts about this user's setup -- "
+                         f"use them before searching):\n{text[:NOTES_MAX_CHARS]}")
+    except OSError:
+        pass
+    for d in dirs:
+        if not d:
+            continue
+        notes_path, notes_text = find_project_notes(d)
+        if notes_text and notes_path.resolve() not in seen:
+            seen.add(notes_path.resolve())
+            parts.append(f"Project notes from {notes_path}:\n{notes_text[:NOTES_MAX_CHARS]}")
+    return "\n\n".join(parts)
+
+
 def python_code_writes_files(code):
     """Whether python_interpreter code writes to the filesystem (those must go through write_file).
     Blocks WRITES only: the old check refused any code containing "open(", so reads like

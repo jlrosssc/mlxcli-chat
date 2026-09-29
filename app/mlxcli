@@ -10,9 +10,12 @@ Usage:
                              Tool calls are pre-approved by default (run_command,
                              write_file, python_interpreter, ssh_read/write/run) —
                              nothing prompts for the rest of the session, and every
-                             tool call runs sandboxed inside an Apple `container`
-                             instance (see ensure_sandbox_container) instead of
-                             directly on the host. Works in both the interactive
+                             tool call runs sandboxed: by default in a macOS
+                             Seatbelt sandbox (reads anywhere, writes only in the
+                             working folder; commands that change Mac settings or
+                             launchd jobs are refused), or in an Apple `container`
+                             instance if sandbox-exec is unavailable or
+                             MLXCLI_SANDBOX=container. Works in both the interactive
                              REPL and headless --run. -y/--yes is still accepted
                              for old scripts/muscle memory but is now a no-op.
   mlxcli [model] --ask       opt back into the old behavior: prompt for approval
@@ -128,6 +131,7 @@ from mlxlib import (
     is_destructive_command, has_override_intent, has_clarify_intent, CLARIFY_MODE_SYSTEM_NOTE, CLARIFY_AUTO_SYSTEM_NOTE,
     repair_truncated_json, read_text_window, clip_output,
     compact_turn_messages, python_code_writes_files,
+    seatbelt_available, seatbelt_profile, mac_state_change, SANDBOX_EXEC, validate_written_file, notes_system_text,
     python_syntax_error, missing_local_imports,
     find_entry_point_candidates, smoke_test_python_app, run_verify_command, run_verify_suite,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
@@ -816,7 +820,20 @@ def request_messages_for_mode(messages, agentic_mode, backend, clarify_mode=Fals
         scoped.insert(insert_at, {"role": "system", "content": (
             "Agentic mode is disabled. Do not attempt tool use; answer only from the provided conversation context."
         )})
-    if agentic_mode and SANDBOX_MODE:
+    if agentic_mode and SANDBOX_MODE and SANDBOX_KIND == "seatbelt":
+        root = load_default_dir().resolve()
+        scoped.insert(insert_at + 1, {"role": "system", "content": (
+            f"Sandbox: run_command and python_interpreter run on this Mac in a sandbox. They can READ anything "
+            f"(~/Library, other folders, launchctl print, defaults read) but can only WRITE inside {root} and temp "
+            f"folders; a write anywhere else fails with 'Operation not permitted'. Commands that change the Mac "
+            f"without writing a file (launchctl load/unload/bootstrap/kickstart, defaults write, osascript, open, "
+            f"killall, brew install, sudo, crontab edits) are refused. `launchctl list` is always empty in the "
+            f"sandbox: use `launchctl print gui/$(id -u)` or `launchctl print gui/$(id -u)/<label>`. write_file "
+            f"outside {root} is refused too. If a task needs a change outside {root}, do the part you can inside "
+            f"it, then tell the user plainly what you could not do and give the exact Terminal commands -- never "
+            f"say it is done."
+        )})
+    elif agentic_mode and SANDBOX_MODE:
         # The model was never told this, and the default system prompt even says ~/Library/CloudStorage is
         # reachable "with your existing tools" -- so it ran ls/find/launchctl against ~/Library in the sandbox,
         # read the empty results as facts about the Mac, and "installed" files that never left the container.
@@ -831,6 +848,9 @@ def request_messages_for_mode(messages, agentic_mode, backend, clarify_mode=Fals
             f"outside {root}, do the part you can inside {root}, then tell the user plainly what you could not do "
             f"and give the exact Terminal commands for it -- never say it is done."
         )})
+    notes = notes_system_text((pathlib.Path.cwd(), load_default_dir()))
+    if notes:
+        scoped.insert(insert_at + 1, {"role": "system", "content": notes})
     if clarify_mode:
         # "auto" = switched on by mlxcli for an interactive agentic turn; anything else
         # truthy = the user's own message asked for it (has_clarify_intent).
@@ -1154,6 +1174,9 @@ ALWAYS_APPROVED = set()
 # sessions (no -y) are never sandboxed — the diff preview + human approval
 # already gates those, same as always.
 SANDBOX_MODE = False
+# "seatbelt" (default: macOS sandbox-exec -- reads anywhere, writes only in the working folder) or
+# "container" (fallback: Apple `container`, which only sees the working folder). Set by enable_sandbox().
+SANDBOX_KIND = None
 SANDBOX_IMAGE = "mlxcli-sandbox:latest"
 SANDBOX_CONTAINER_NAME = f"mlxcli-sandbox-{os.getpid()}"
 
@@ -1237,7 +1260,7 @@ def ensure_sandbox_container():
     a missing binary or a genuinely broken image shouldn't retry, just fail
     the same way it always did."""
     global _sandbox_started, SANDBOX_MODE
-    if _sandbox_started or not SANDBOX_MODE:
+    if _sandbox_started or not SANDBOX_MODE or SANDBOX_KIND == "seatbelt":
         return
     workdir = load_default_dir().resolve()
     prune_stopped_sandbox_containers()  # clean up leftovers from prior crashed/killed sessions
@@ -1265,6 +1288,39 @@ def ensure_sandbox_container():
         return
     _sandbox_started = True
     print(f"  (sandbox container started: {SANDBOX_CONTAINER_NAME}, workspace={workdir})")
+
+
+def enable_sandbox():
+    """Turn sandboxing on, preferring Seatbelt. False if neither sandbox is available on this Mac."""
+    global SANDBOX_MODE, SANDBOX_KIND
+    if seatbelt_available():
+        SANDBOX_MODE, SANDBOX_KIND = True, "seatbelt"
+    elif shutil.which("container"):
+        SANDBOX_MODE, SANDBOX_KIND = True, "container"
+    return SANDBOX_MODE
+
+
+def seatbelt_run(argv, cwd=None, timeout=180):
+    root = load_default_dir().resolve()
+    return subprocess.run([SANDBOX_EXEC, "-p", seatbelt_profile(root), *argv], capture_output=True, text=True,
+                          timeout=timeout, cwd=cwd or str(root))
+
+
+def seatbelt_notes(cmd, out):
+    """Notes appended to a Seatbelt-sandboxed result. Writes outside the working folder fail for real, so
+    say why (and mark it so the turn-end warning lists it); `launchctl list` is always empty for a
+    sandboxed process, which reads as "no jobs loaded" unless flagged."""
+    root = load_default_dir().resolve()
+    notes = ""
+    if "operation not permitted" in (out or "").lower():
+        notes += ("\n" + SANDBOX_HOST_MARKER + " Error: a write outside " + str(root) + " was blocked by the "
+                  "sandbox, so that part did NOT happen on the Mac. Do not report it as done; tell the user "
+                  "plainly and give them the exact command to run themselves.")
+    if re.search(r"\blaunchctl\s+list\b", cmd or ""):
+        notes += ("\n" + SANDBOX_HOST_MARKER + " Error: `launchctl list` always comes back empty inside the "
+                  "sandbox, so this output says nothing about which jobs are loaded. Use `launchctl print "
+                  "gui/$(id -u)` (all jobs) or `launchctl print gui/$(id -u)/<label>` (one job) instead.")
+    return notes
 
 
 def teardown_sandbox_container():
@@ -1383,15 +1439,13 @@ def approve(desc, category=None):
         # same sandbox protection -y gets — for the whole rest of the session,
         # not just this category, since the sandbox container is one shared
         # instance rather than scoped per tool category.
-        global SANDBOX_MODE
         if not SANDBOX_MODE:
-            if shutil.which("container"):
-                SANDBOX_MODE = True
+            if enable_sandbox():
                 print("  (switching the rest of this session to sandboxed execution — "
                       "auto-approved actions no longer get human review, so they "
                       "shouldn't touch the real filesystem unreviewed either)")
             else:
-                print("  (note: Apple's `container` tool wasn't found, so auto-approved "
+                print("  (note: no sandbox is available (sandbox-exec or Apple's `container`), so auto-approved "
                       "actions will still run unsandboxed directly on this machine)")
         return True
     return ch == "y"
@@ -1563,6 +1617,18 @@ def exec_tool(name, args, current_user_text=None):
         if not approve(f"run: {cmd}", category="run_command"):
             return "User declined."
         try:
+            if SANDBOX_MODE and SANDBOX_KIND == "seatbelt":
+                why = mac_state_change(cmd)
+                if why:
+                    return (f"exit_code=1\n{SANDBOX_HOST_MARKER} Error: NOT run. This command {why}, which the "
+                            f"sandbox does not allow, so nothing on the Mac changed. Do not report it as done; tell "
+                            f"the user plainly and give them the exact command to run in Terminal themselves.")
+                cwd = infer_command_cwd(cmd)
+                p = seatbelt_run(["/bin/sh", "-c", cmd], cwd=cwd)
+                out = (p.stdout + p.stderr).strip()
+                location = (f"\nworking_directory={cwd or load_default_dir().resolve()} (sandboxed: can read "
+                            f"anywhere, can write only in {load_default_dir().resolve()})" + seatbelt_notes(cmd, out))
+                return f"exit_code={p.returncode}{location}\n{clip_output(out) if out else '(no output)'}"
             if SANDBOX_MODE:
                 ensure_sandbox_container()
             if SANDBOX_MODE and _sandbox_started:
@@ -1593,6 +1659,11 @@ def exec_tool(name, args, current_user_text=None):
         if not approve(f"run Python code ({len(code)} chars)", category="python_interpreter"):
             return "User declined."
         try:
+            if SANDBOX_MODE and SANDBOX_KIND == "seatbelt":
+                p = seatbelt_run([sys.executable, "-c", code])
+                out = (p.stdout + p.stderr).strip()
+                return (f"exit_code={p.returncode}{seatbelt_notes('', out)}\n"
+                        f"{clip_output(out) if out else '(no output)'}")
             if SANDBOX_MODE:
                 ensure_sandbox_container()
             if SANDBOX_MODE and _sandbox_started:
@@ -1845,6 +1916,11 @@ def exec_tool(name, args, current_user_text=None):
             target.relative_to(load_default_dir().resolve())
         except ValueError:
             in_workspace = False
+        if SANDBOX_MODE and not in_workspace and SANDBOX_KIND == "seatbelt":
+            return (f"{SANDBOX_HOST_MARKER} Error: NOT written. {target} is outside the working folder "
+                    f"({load_default_dir().resolve()}), where the sandbox can't write, so nothing on the Mac changed. "
+                    f"Write the file inside the working folder instead and give the user the one command that copies "
+                    f"it into place, and say plainly that you did not install it.")
         if SANDBOX_MODE and not in_workspace:
             ensure_sandbox_container()
             if _sandbox_started:
@@ -1875,6 +1951,10 @@ def exec_tool(name, args, current_user_text=None):
             target.write_text(content)
             note = f" (previous version backed up to {backup_path})" if backup_path else ""
             result = f"Written: {target} ({target.stat().st_size} bytes).{note}"
+            problem = validate_written_file(target)
+            if problem:
+                return (f"{result} Error: the file was written but fails its check -- {problem}. It will not work as "
+                        f"is: fix it with write_file before reporting completion.")
             if target.suffix == ".py":
                 syntax_error = python_syntax_error(content)
                 if syntax_error:
@@ -4350,9 +4430,9 @@ def _warn_sandbox_blocked(blocked):
     things on the Mac that only happened (or didn't) inside the container."""
     if not blocked:
         return
-    print(f"(warning: {len(blocked)} command(s) this turn targeted your Mac outside the working directory but ran "
-          f"only in the sandbox -- nothing they changed reached your Mac, and what they 'found' says nothing about it. "
-          f"Ignore any claim above that depends on them:)")
+    print(f"(warning: {len(blocked)} tool call(s) this turn could not be done or checked from the sandbox -- "
+          f"anything they were meant to change on your Mac did NOT happen, and what they 'found' says nothing "
+          f"about it. Ignore any claim above that depends on them:)")
     for item in blocked[:8]:
         print(f"   - {item}")
     if len(blocked) > 8:
@@ -5632,12 +5712,9 @@ def main():
         # No human is watching each tool call before it runs in this mode, so
         # route the agentic tool-execution layer through the Apple `container`
         # sandbox instead of the host directly (see ensure_sandbox_container).
-        global SANDBOX_MODE
-        if shutil.which("container"):
-            SANDBOX_MODE = True
-        else:
-            print("  (note: tool calls are auto-approved by default, but Apple's `container` tool wasn't "
-                  "found — tool calls will run unsandboxed directly on this machine; pass --ask to review "
+        if not enable_sandbox():
+            print("  (note: tool calls are auto-approved by default, but no sandbox (sandbox-exec or Apple's "
+                  "`container`) was found — tool calls will run unsandboxed directly on this machine; pass --ask to review "
                   "each call instead)")
     if run_task:
         import mlxlib as _ml
