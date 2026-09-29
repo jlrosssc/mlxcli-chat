@@ -774,16 +774,50 @@ CLARIFY_MODE_SYSTEM_NOTE = (
 # front when the request doesn't say WHERE to look or WHAT exactly to do, before
 # a broad search starts -- not a license to check in on every step.
 CLARIFY_AUTO_SYSTEM_NOTE = (
-    "Clarify mode is on for this request. If the request does not say where the thing it "
-    "asks about lives (which machine, service, file, folder, or config) or leaves a choice "
-    "open that would change what you do, and you cannot settle it with ONE quick, targeted "
-    "check, call ask_user once BEFORE starting a broad search -- a single question like "
-    "\"is this a launchd job, a cron job, or a Home Assistant automation?\" costs the user "
-    "seconds, while dozens of speculative searches cost minutes and fill your context. Give "
-    "concrete options when you can. Ask at most twice per request, one question at a time. "
-    "If the request is already specific enough, do not ask; just proceed. Never use ask_user "
-    "to ask permission to run a tool -- that is handled separately and automatically."
+    "Clarify mode is on for this request. Before doing the work, check two things:\n"
+    "1. Can the request reasonably be read in two or more ways that would give a DIFFERENT result? "
+    "Typical forks: a counting, numbering or ordering rule (what counts as the 1st, 2nd, 3rd item; "
+    "whether a repeating sequence restarts or carries on; what happens to an item that is skipped), "
+    "which of several files or items is meant, which output format or layout is wanted, or the exact "
+    "scope of a change that is hard to undo.\n"
+    "2. Does the request leave out WHERE the thing lives (which machine, service, file, folder or config), "
+    "so that finding it would take more than one quick, targeted check?\n"
+    "If either is true and earlier messages don't already settle it, call ask_user ONCE before starting: "
+    "say in a sentence what you are unsure about and give the concrete readings as options. A question "
+    "costs the user seconds; building the wrong thing or running dozens of speculative searches costs "
+    "minutes. If only one reading makes sense, the difference is cosmetic, or the user already answered "
+    "it, do not ask; just proceed. Ask at most twice per request, one question at a time. Never use "
+    "ask_user to ask permission to run a tool -- that is handled separately and automatically."
 )
+
+
+# Short reminder attached to the end of the user's own message (on the copy sent to the
+# model, never the saved history). Local models weigh the latest user turn far more than
+# one paragraph inside a long merged system block, which is where the notes above end up.
+CLARIFY_USER_REMINDER = (
+    "\n\n[Note: clarify mode is on. If this request can be read more than one way in a way "
+    "that changes the result, call ask_user with the options before doing the work.]"
+)
+
+
+def apply_clarify_mode(messages, clarify_mode):
+    """Return a copy of an outgoing request with clarify instructions added, or the same
+    list when clarify_mode is off. The note goes LAST among the system messages (after
+    every other note) and a one-line reminder is appended to the latest user message.
+    clarify_mode: "auto" (switched on by the app) or any other truthy value (the user's
+    own message asked for it, see has_clarify_intent)."""
+    if not clarify_mode:
+        return messages
+    note = CLARIFY_AUTO_SYSTEM_NOTE if clarify_mode == "auto" else CLARIFY_MODE_SYSTEM_NOTE
+    out = list(messages)
+    last_system = max((i for i, m in enumerate(out) if m.get("role") == "system"), default=-1)
+    out.insert(last_system + 1, {"role": "system", "content": note})
+    for i in range(len(out) - 1, -1, -1):
+        m = out[i]
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            out[i] = dict(m, content=m["content"] + CLARIFY_USER_REMINDER)
+            break
+    return out
 
 
 def has_clarify_intent(user_message):

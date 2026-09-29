@@ -39,7 +39,7 @@ from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QComboBox, QLabel, QMessageBox, QFileDialog, QDialog, QFormLayout,
-    QDoubleSpinBox, QSpinBox, QDialogButtonBox, QSizePolicy,
+    QDoubleSpinBox, QSpinBox, QDialogButtonBox, QSizePolicy, QInputDialog,
 )
 
 try:
@@ -70,7 +70,7 @@ from mlxlib import (
     should_auto_enable_agentic, requires_agentic_execution, execution_contract,
     tool_result_failed, resolve_output_path, normalize_tool_name, infer_command_cwd,
     backup_before_overwrite, find_project_notes, last_artifact_system_note, record_last_artifact,
-    python_syntax_error, missing_local_imports,
+    python_syntax_error, missing_local_imports, has_clarify_intent, apply_clarify_mode,
     parse_bare_json_tool_call, parse_xml_tag_tool_call, parse_python_call_tool_call,
     parse_attr_tag_tool_call,
     load_model_settings, save_model_settings, MODEL_SETTING_BOUNDS,
@@ -553,8 +553,28 @@ class ChatWindow(QMainWindow):
                 return False
         return result["approved"]
 
+    def request_user_answer(self, question, options):
+        event = threading.Event()
+        result = {"answer": None}
+        self.events.put(("ask_user", question, options, event, result))
+        while not event.wait(0.1):
+            if self.cancel_requested:
+                return None
+        return result["answer"]
+
     def execute_tool(self, name, args):
         name = str(name or "").strip().lower().replace(".", ":").replace("/", ":").rsplit(":", 1)[-1]
+        if name == "ask_user":
+            question = str(args.get("question") or "").strip()
+            options = [str(o) for o in (args.get("options") or []) if str(o).strip()]
+            if not question:
+                return "Error: ask_user needs a non-empty 'question'."
+            answer = self.request_user_answer(question, options)
+            if not answer:
+                return "The user gave no answer. Proceed using your own best judgment instead, and say what you assumed."
+            if options and answer.isdigit() and 1 <= int(answer) <= len(options):
+                answer = options[int(answer) - 1]
+            return answer
         if name == "run_command":
             command = args.get("command", "")
             try:
@@ -747,6 +767,9 @@ class ChatWindow(QMainWindow):
             else:
                 working_messages.insert(0, {"role": "system", "content": agentic_note})
         effective_agentic = agentic
+        # Same rule as mlxcli: the user's own keyword turns on the full clarify note; otherwise
+        # agentic turns get the automatic one. Someone is always at the window to answer.
+        clarify_mode = has_clarify_intent(self.last_user_text) or ("auto" if agentic else False)
         model_settings = load_model_settings(self.backend)
         # Same guards as mlxcli's turn loop: stop when two steps in a row (or A,B,A,B) return nothing new,
         # and shrink older tool results once the prompt nears the server's context window.
@@ -755,7 +778,7 @@ class ChatWindow(QMainWindow):
         stuck_repeat_streak = 0
         for _step in range(MAX_TOOL_STEPS):
             payload = {
-                "model": model, "messages": working_messages,
+                "model": model, "messages": apply_clarify_mode(working_messages, clarify_mode),
                 "max_tokens": model_settings["max_tokens"], "stream": True,
                 "stream_options": {"include_usage": True},
                 "temperature": model_settings["temperature"], "top_p": model_settings["top_p"],
@@ -935,6 +958,17 @@ class ChatWindow(QMainWindow):
                                                         QMessageBox.Yes | QMessageBox.No)
                         approval_result["approved"] = answer == QMessageBox.Yes
                     approval_event.set()
+                elif kind == "ask_user":
+                    _kind, question, options, answer_event, answer_result = event
+                    if not self.cancel_requested:
+                        if options:
+                            # Editable, so the user can type their own answer instead of a listed one.
+                            answer, ok = QInputDialog.getItem(self, "The model has a question", question,
+                                                              options, 0, True)
+                        else:
+                            answer, ok = QInputDialog.getText(self, "The model has a question", question)
+                        answer_result["answer"] = (answer or "").strip() if ok else None
+                    answer_event.set()
                 elif kind == "tool_history":
                     self.messages.append(event[1])
                 elif kind == "append":

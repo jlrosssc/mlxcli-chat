@@ -80,10 +80,12 @@ unsure", "check with me first", or "ask before" — anywhere in a request (REPL,
 --run, or the GUI's input box) to have the model pause and ask a direct question
 via the ask_user tool before making a risky guess on an ambiguous or high-stakes
 decision point, instead of silently picking one interpretation. It waits for your
-typed answer (a dialog box in mlxgui) before continuing. Off by default — ordinary
-requests get no extra questions — and skipped automatically in headless --run
-(nothing to answer it), where the model is told to proceed on its own judgment
-instead. Example: `create an app to show distance, ask me if unsure about units`.
+typed answer (a dialog box in mlxgui) before continuing. Without a keyword, a
+lighter automatic version is on for requests that use tools: the model asks once,
+up front, only when the request can be read two ways that give different results
+or doesn't say where something lives. Skipped in headless --run (nothing to
+answer it), where the model proceeds on its own judgment instead.
+Example: `create an app to show distance, ask me if unsure about units`.
 
 Commands:
   /tokenmax <request>  /tokenlocal <request>  /paste <file>  /review <file-or-folder> [glob]  /read <file>  /transcript <youtube-url>  /find <path> <pattern>  /ls <path>  /gitstatus [path]  /gitdiff [path]
@@ -104,9 +106,11 @@ except ImportError:
 import select
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 import urllib.error
@@ -128,7 +132,7 @@ from mlxlib import (
     is_code_request, requires_agentic_execution, should_auto_enable_agentic,
     execution_contract, tool_result_failed, resolve_output_path,
     normalize_tool_name, infer_command_cwd,
-    is_destructive_command, has_override_intent, has_clarify_intent, CLARIFY_MODE_SYSTEM_NOTE, CLARIFY_AUTO_SYSTEM_NOTE,
+    is_destructive_command, has_override_intent, has_clarify_intent, apply_clarify_mode,
     repair_truncated_json, read_text_window, clip_output,
     compact_turn_messages, python_code_writes_files,
     seatbelt_available, seatbelt_profile, mac_state_change, SANDBOX_EXEC, validate_written_file, notes_system_text,
@@ -855,11 +859,10 @@ def request_messages_for_mode(messages, agentic_mode, backend, clarify_mode=Fals
     notes = notes_system_text((pathlib.Path.cwd(), load_default_dir()))
     if notes:
         scoped.insert(insert_at + 1, {"role": "system", "content": notes})
-    if clarify_mode:
-        # "auto" = switched on by mlxcli for an interactive agentic turn; anything else
-        # truthy = the user's own message asked for it (has_clarify_intent).
-        note = CLARIFY_AUTO_SYSTEM_NOTE if clarify_mode == "auto" else CLARIFY_MODE_SYSTEM_NOTE
-        scoped.insert(insert_at + 1, {"role": "system", "content": note})
+    # Added last so the clarify note ends up at the end of the (possibly merged) system
+    # block, with a reminder on the user's message. "auto" = switched on by mlxcli for an
+    # interactive agentic turn; anything else truthy = the user's message asked for it.
+    scoped = apply_clarify_mode(scoped, clarify_mode)
     if is_turbo_backend(backend):
         scoped = collapse_system_messages(scoped)
     return scoped
@@ -1195,12 +1198,23 @@ REMOTE_MODE_HOST = None
 _sandbox_started = False
 
 
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def prune_stopped_sandbox_containers():
-    """Delete any stopped mlxcli-sandbox-* containers left behind by prior
-    sessions that didn't exit cleanly (killed process, closed terminal,
-    crash) and so never reached teardown_sandbox_container(). Only touches
-    stopped containers -- a sandbox still running under another live mlxcli
-    session's PID is left alone."""
+    """Delete mlxcli-sandbox-* containers left behind by prior sessions that
+    didn't exit cleanly (killed process, closed terminal, crash) and so never
+    reached teardown_sandbox_container(). A container is removed when it is
+    stopped, or when it is still running but the mlxcli PID in its name is
+    gone -- those orphans otherwise keep running (and holding memory) for
+    days. A sandbox whose owning mlxcli session is still alive is left alone."""
     try:
         p = subprocess.run(["container", "list", "-a", "--format", "json"],
                             capture_output=True, text=True, timeout=15)
@@ -1210,8 +1224,12 @@ def prune_stopped_sandbox_containers():
     for c in containers:
         cid = c.get("id", "")
         state = c.get("status", {}).get("state", "")
-        if cid.startswith("mlxcli-sandbox-") and state != "running":
-            subprocess.run(["container", "delete", "-f", cid], capture_output=True)
+        if not cid.startswith("mlxcli-sandbox-") or cid == SANDBOX_CONTAINER_NAME:
+            continue
+        owner = cid.rsplit("-", 1)[-1]
+        orphaned = owner.isdigit() and not _pid_alive(int(owner))
+        if state != "running" or orphaned:
+            subprocess.run(["container", "delete", "-f", cid], capture_output=True, timeout=60)
 
 
 # Signature of the one specific failure ensure_sandbox_container knows how
@@ -1331,12 +1349,34 @@ def teardown_sandbox_container():
     global _sandbox_started
     if not _sandbox_started:
         return
-    subprocess.run(["container", "stop", SANDBOX_CONTAINER_NAME], capture_output=True, timeout=30)
-    subprocess.run(["container", "delete", "-f", SANDBOX_CONTAINER_NAME], capture_output=True, timeout=30)
+    # A second Ctrl-C while the container is stopping used to abort this and
+    # leave the container running forever; finish the cleanup regardless.
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except ValueError:
+        pass  # not the main thread
+    subprocess.run(["container", "delete", "-f", SANDBOX_CONTAINER_NAME], capture_output=True, timeout=60)
     _sandbox_started = False
 
 
 atexit.register(teardown_sandbox_container)
+
+
+def _exit_on_signal(signum, _frame):
+    # Closing the Terminal window (SIGHUP) or `kill` (SIGTERM) skips atexit by
+    # default; turn them into a normal exit so the sandbox is torn down.
+    sys.exit(128 + signum)
+
+
+for _sig in (signal.SIGHUP, signal.SIGTERM):
+    signal.signal(_sig, _exit_on_signal)
+
+
+def prune_orphan_sandboxes_in_background():
+    """Startup sweep for containers orphaned by earlier sessions. Runs even when
+    this session uses Seatbelt (and so never calls ensure_sandbox_container)."""
+    if shutil.which("container"):
+        threading.Thread(target=prune_stopped_sandbox_containers, daemon=True).start()
 
 
 def sandbox_container_path(target):
@@ -5673,6 +5713,7 @@ def _run_tokenmax_job(rest, backend, model=None):
 
 def main():
     configure_readline()
+    prune_orphan_sandboxes_in_background()
     backend, url, key = load_cfg()
     global SHOW_THINKING
     global REMOTE_MODE_HOST
