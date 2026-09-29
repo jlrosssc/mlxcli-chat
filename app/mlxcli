@@ -5740,9 +5740,7 @@ def main():
         model_arg = None
     model = model_arg or (available_models[0] if run_task else pick_model(backend, url, key))
     messages = [{"role": "system", "content": system}]
-    notes_path, notes_text = find_project_notes()
-    if notes_text:
-        messages.append({"role": "system", "content": f"Project notes from {notes_path}:\n\n{notes_text}"})
+    # Project/user notes are added fresh every turn by request_messages_for_mode (notes_system_text).
     artifact_note = last_artifact_system_note()
     if artifact_note:
         messages.append({"role": "system", "content": artifact_note})
