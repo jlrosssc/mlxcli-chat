@@ -1201,6 +1201,59 @@ def notes_system_text(dirs=()):
     return "\n\n".join(parts)
 
 
+# --- Read before overwrite (like Claude Code): an existing file may only be overwritten after the model
+# has seen its current contents. Without this a small model "fixes" a document by rewriting it from
+# memory of what it wrote earlier, quietly undoing other edits or dropping content.
+_KNOWN_FILES = {}
+
+
+def _file_stamp(path):
+    try:
+        st = pathlib.Path(path).stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def note_file_known(path):
+    """Record that the model has the current contents of `path` (it just read or wrote it)."""
+    stamp = _file_stamp(path)
+    if stamp:
+        _KNOWN_FILES[str(pathlib.Path(path).expanduser().resolve())] = stamp
+
+
+def overwrite_needs_read(path):
+    """An error message if `path` exists and the model hasn't read it since it last changed, else None."""
+    target = pathlib.Path(path).expanduser().resolve()
+    stamp = _file_stamp(target)
+    if stamp is None or not target.is_file():
+        return None  # new file: nothing to lose
+    known = _KNOWN_FILES.get(str(target))
+    if known == stamp:
+        return None
+    why = "has changed since you last read it" if known else "already exists and you have not read it in this session"
+    return (f"Error: NOT written. {target} {why}. Read it with read_file first, then write your change based on "
+            f"its CURRENT contents (keep everything the user didn't ask to change).")
+
+
+def compact_call_arguments(fn, args_str, note):
+    """Replacement arguments for a compacted tool call that still say WHAT it acted on. Dropping the whole
+    argument string also dropped the file path, so a few turns later the model no longer knew which
+    document it had created and couldn't find it to fix it."""
+    keep = {"__compacted__": True, "fn": fn, "note": note}
+    try:
+        args = json.loads(args_str)
+    except (TypeError, ValueError):
+        args = None
+    if isinstance(args, dict):
+        for key in ("path", "host", "target", "method", "action", "url"):
+            if isinstance(args.get(key), str) and args[key]:
+                keep[key] = args[key][:300]
+        if isinstance(args.get("command"), str):
+            keep["command"] = args["command"][:200]
+    return json.dumps(keep)
+
+
 def python_code_writes_files(code):
     """Whether python_interpreter code writes to the filesystem (those must go through write_file).
     Blocks WRITES only: the old check refused any code containing "open(", so reads like
@@ -2471,11 +2524,8 @@ def compact_turn_messages(messages, turn_start_index, keep_recent_rounds=KEEP_RE
             if len(args_str) > COMPACT_MIN_CHARS and '"__compacted__"' not in args_str:
                 tc = copy.deepcopy(tc)
                 fn_name = tc.get("function", {}).get("name", "?")
-                tc["function"]["arguments"] = json.dumps({
-                    "__compacted__": True,
-                    "fn": fn_name,
-                    "note": f"{len(args_str):,} chars omitted — already applied earlier this turn",
-                })
+                tc["function"]["arguments"] = compact_call_arguments(
+                    fn_name, args_str, f"{len(args_str):,} chars omitted — already applied earlier this turn")
                 chars_saved += len(args_str) - len(tc["function"]["arguments"])
                 assistant_changed = True
             compacted_calls.append(tc)

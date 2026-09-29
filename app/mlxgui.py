@@ -593,13 +593,18 @@ class ChatWindow(QMainWindow):
             if path.is_dir():
                 return f"Error: {path} is a directory, not a file. Use run_command with 'ls' or 'find' to see its contents."
             try:
-                return _ml.read_text_window(path.read_text(errors="replace"), args)
+                text = path.read_text(errors="replace")
+                _ml.note_file_known(path)
+                return _ml.read_text_window(text, args)
             except Exception as exc:
                 return f"Error: {exc}"
         if name == "write_file":
             raw_path = args.get("path", "")
             content = args.get("content", args.get("text", ""))
             target = resolve_output_path(raw_path)
+            need_read = _ml.overwrite_needs_read(target)
+            if need_read:
+                return need_read
             old = ""
             if target.exists():
                 try:
@@ -613,6 +618,7 @@ class ChatWindow(QMainWindow):
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content)
+                _ml.note_file_known(target)
                 record_last_artifact(target, self.last_user_text)
                 note = f" (previous version backed up to {backup_path})" if backup_path else ""
                 result = f"Written: {target} ({target.stat().st_size} bytes).{note}"

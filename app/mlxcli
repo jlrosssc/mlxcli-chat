@@ -132,6 +132,7 @@ from mlxlib import (
     repair_truncated_json, read_text_window, clip_output,
     compact_turn_messages, python_code_writes_files,
     seatbelt_available, seatbelt_profile, mac_state_change, SANDBOX_EXEC, validate_written_file, notes_system_text,
+    note_file_known, overwrite_needs_read, compact_call_arguments,
     python_syntax_error, missing_local_imports,
     find_entry_point_candidates, smoke_test_python_app, run_verify_command, run_verify_suite,
     backup_before_overwrite, find_project_notes, PROJECT_NOTES_FILENAMES,
@@ -848,6 +849,9 @@ def request_messages_for_mode(messages, agentic_mode, backend, clarify_mode=Fals
             f"outside {root}, do the part you can inside {root}, then tell the user plainly what you could not do "
             f"and give the exact Terminal commands for it -- never say it is done."
         )})
+    artifact_note = last_artifact_system_note()
+    if artifact_note:
+        scoped.insert(insert_at + 1, {"role": "system", "content": artifact_note})
     notes = notes_system_text((pathlib.Path.cwd(), load_default_dir()))
     if notes:
         scoped.insert(insert_at + 1, {"role": "system", "content": notes})
@@ -1874,6 +1878,7 @@ def exec_tool(name, args, current_user_text=None):
         try:
             text = target.read_text()
             print(f"  read: {args['path']} ({len(text)} chars)")
+            note_file_known(target)
             return read_text_window(text, args)
         except Exception as e:
             return f"Error: {e}"
@@ -1891,6 +1896,9 @@ def exec_tool(name, args, current_user_text=None):
                 old = target.read_text(errors="replace")
             except Exception:
                 old = ""
+        need_read = overwrite_needs_read(target)
+        if need_read:
+            return need_read
         if target.suffix == ".py" and target.exists() and "zcta" in old.lower() and re.search(r"\bzzcta\b", content, re.IGNORECASE):
             return "Error: rejected suspicious overwrite; proposed Python content changes zcta to zzcta in an existing validated script. Inspect and preserve the existing file."
         # Existing-file overwrites are gated by the interactive approve() prompt below
@@ -1949,6 +1957,7 @@ def exec_tool(name, args, current_user_text=None):
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
+            note_file_known(target)
             note = f" (previous version backed up to {backup_path})" if backup_path else ""
             result = f"Written: {target} ({target.stat().st_size} bytes).{note}"
             problem = validate_written_file(target)
@@ -4854,11 +4863,9 @@ def compact_old_tool_content(messages, keep_recent_turns=KEEP_RECENT_TURNS_INTAC
                 args_str = tc.get("function", {}).get("arguments") or ""
                 if len(args_str) > COMPACT_MIN_CHARS and '"__compacted__"' not in args_str:
                     tc = copy.deepcopy(tc)
-                    tc["function"]["arguments"] = json.dumps({
-                        "__compacted__": True,
-                        "fn": tc.get("function", {}).get("name", "?"),
-                        "note": f"{len(args_str):,} chars omitted — from an earlier turn in this conversation",
-                    })
+                    tc["function"]["arguments"] = compact_call_arguments(
+                        tc.get("function", {}).get("name", "?"), args_str,
+                        f"{len(args_str):,} chars omitted — from an earlier turn in this conversation")
                     chars_saved += len(args_str) - len(tc["function"]["arguments"])
                     changed = True
                 compacted_calls.append(tc)
@@ -5740,10 +5747,8 @@ def main():
         model_arg = None
     model = model_arg or (available_models[0] if run_task else pick_model(backend, url, key))
     messages = [{"role": "system", "content": system}]
-    # Project/user notes are added fresh every turn by request_messages_for_mode (notes_system_text).
-    artifact_note = last_artifact_system_note()
-    if artifact_note:
-        messages.append({"role": "system", "content": artifact_note})
+    # Project/user notes and the last-saved-file reminder are added fresh every turn by
+    # request_messages_for_mode, so they always name the current file.
 
     if run_task:
         # Headless one-shot mode: run a single task non-interactively and exit —
@@ -5921,9 +5926,6 @@ def main():
             continue
         if user == "/clear":
             messages = [{"role": "system", "content": system}]
-            artifact_note = last_artifact_system_note()
-            if artifact_note:
-                messages.append({"role": "system", "content": artifact_note})
             last_user_request = ""
             state["last_paths"] = []
             state["current_remote"] = None
