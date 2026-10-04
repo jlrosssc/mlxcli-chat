@@ -82,6 +82,12 @@ mkdir -p "$BASE" "$BIN_DIR"
 rm -rf "$BASE/app"
 cp -R "$SRC/app" "$BASE/app"
 cp "$SRC/assets/AppIcon.icns" "$BASE/AppIcon.icns"
+# Optional: Apple Intelligence helper for the "?" prompt refiner (needs macOS 26+ and the Swift compiler;
+# without it "?" quietly uses the local model instead).
+if command -v swiftc >/dev/null 2>&1 && [ -f "$BASE/app/applefm.swift" ]; then
+  swiftc -O -parse-as-library "$BASE/app/applefm.swift" -o "$BASE/app/applefm" >/dev/null 2>&1 \
+    && info "Apple Intelligence helper built" || rm -f "$BASE/app/applefm"
+fi
 info "$BASE/app"
 
 say "Setting up Python (private copy, ~550 MB)"

@@ -11,11 +11,11 @@ Scope, honestly stated: this is a rewrite of the CHAT window only (this is mlxcl
 exclusively chat" by design -- see project notes). Kept: streaming chat, tool calls with an approval
 dialog before each one runs, model picker (Gemma/Qwen3 via oMLX), warm-up on load, New Chat/Clear,
 Import (attach a file's path so the model can read it), Settings (system prompt + generation
-parameters), Word-document export, and the token/time-per-turn display (always visible -- Qt's
+parameters), Word-document export, Apple Intelligence prompt help (Refine button or a leading "?"), and the token/time-per-turn display (always visible -- Qt's
 layout doesn't have the "must maximize the window" bug the old Tk toolbar had).
 Deferred, not carried over from the general-purpose mlxgui coding tool this was adapted from:
 backend switching (this build is locked to oMLX), RAG folder chat, tokenmax/tokenlocal routing, the
-prompt-refine ("?") shortcut, repo/model update-check banners (those only apply to the TurboFieldfare
+repo/model update-check banners (those only apply to the TurboFieldfare
 coding backends, which this build never uses), and saved-session load/save. None of that is wired
 into the chat-only launcher today, so nothing here is a loss versus what a chat user was using.
 """
@@ -34,12 +34,12 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtCore import Qt, QTimer, QSize, QObject, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QComboBox, QLabel, QMessageBox, QFileDialog, QDialog, QFormLayout,
-    QDoubleSpinBox, QSpinBox, QDialogButtonBox, QSizePolicy, QInputDialog,
+    QDoubleSpinBox, QSpinBox, QDialogButtonBox, QSizePolicy, QInputDialog, QLineEdit,
 )
 
 try:
@@ -277,6 +277,11 @@ def _inline_md(text):
 # Main window
 # ---------------------------------------------------------------------------
 
+class AppleBridge(QObject):
+    """Carries Apple Intelligence replies from worker threads back to the GUI thread."""
+    done = Signal(str, str)
+
+
 class ChatWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -305,6 +310,9 @@ class ChatWindow(QMainWindow):
         self._assistant_raw = ""
 
         self._build_ui()
+        _mem_note = _ml.memory_advisory()
+        if _mem_note:
+            self.append_meta(_mem_note)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.drain_events)
@@ -327,7 +335,7 @@ class ChatWindow(QMainWindow):
         top.addWidget(self.model_box)
         for label, handler in (
             ("New Chat", self.new_chat), ("Clear", self.clear_chat),
-            ("Import", self.import_files), ("Settings", self.open_settings),
+            ("Import", self.import_files), ("Refine", self.refine_prompt), ("Settings", self.open_settings),
         ):
             btn = QPushButton(label)
             btn.clicked.connect(handler)
@@ -722,11 +730,123 @@ class ChatWindow(QMainWindow):
                 return f"Error running plugin tool '{name}': {exc}"
         return f"Unknown tool: {name}"
 
+    # ---- Apple Intelligence prompt help ("Refine" button, or start a message with "?") ----
+
+    def refine_prompt(self, request_text=None):
+        raw = (request_text or self.input.toPlainText().strip().lstrip("?").strip()
+               or getattr(self, "last_user_text", "")).strip()
+        if not raw:
+            QMessageBox.information(self, "Refine prompt",
+                                    "Type what you want to ask in the message box first, then press Refine.")
+            return
+        if os.environ.get("MLXGUI_NO_APPLE"):
+            QMessageBox.information(self, "Refine prompt", "Apple Intelligence prompt help is turned off.")
+            return
+        self.status("Asking Apple Intelligence to improve your prompt...")
+        bridge = AppleBridge(self)
+        chat = _ml.AppleChat()
+        ctx = _ml.apple_context(list(self.messages), {"model": self.selected_model_id() or "", "cwd": os.getcwd()})
+        first_prompt = _ml.apple_refine_first_prompt(raw, ctx)
+
+        def work():
+            try:
+                if not chat.available():
+                    raise RuntimeError("Apple Intelligence isn't available on this Mac "
+                                       "(it needs macOS 26 or later with Apple Intelligence turned on).")
+                bridge.done.emit(chat.ask(first_prompt, first=True), "")
+            except Exception as exc:
+                bridge.done.emit("", str(exc))
+
+        bridge.done.connect(lambda reply, err: self._open_apple_dialog(chat, bridge, reply, err))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_apple_dialog(self, chat, bridge, first_reply, err):
+        bridge.done.disconnect()
+        if err:
+            chat.close()
+            self.status("Prompt help unavailable")
+            QMessageBox.information(self, "Apple Intelligence", err)
+            return
+        self.status("Apple Intelligence is helping with your prompt")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Apple Intelligence - prompt help")
+        dlg.resize(620, 460)
+        lay = QVBoxLayout(dlg)
+        log = QTextBrowser()
+        lay.addWidget(log, stretch=1)
+        state = {"last": first_reply}
+
+        def add(who, text):
+            log.append(f"<p><b>{who}:</b> {html.escape(text).replace(chr(10), '<br>')}</p>")
+
+        add("Apple", first_reply)
+        row = QHBoxLayout()
+        follow = QLineEdit()
+        follow.setPlaceholderText("Ask for changes (e.g. \"shorter\", \"mention the file size\") and press Return")
+        ask_btn = QPushButton("Ask Apple")
+        row.addWidget(follow, stretch=1)
+        row.addWidget(ask_btn)
+        lay.addLayout(row)
+        buttons = QHBoxLayout()
+        use_btn = QPushButton("Use this prompt")
+        use_btn.setDefault(True)
+        cancel_btn = QPushButton("Cancel")
+        buttons.addStretch(1)
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(use_btn)
+        lay.addLayout(buttons)
+
+        def got(reply, error):
+            ask_btn.setEnabled(True)
+            follow.setEnabled(True)
+            if error:
+                add("Apple", f"[error] {error}")
+            else:
+                state["last"] = reply
+                add("Apple", reply)
+            follow.setFocus()
+
+        bridge.done.connect(got)
+
+        def ask():
+            text = follow.text().strip()
+            if not text:
+                return
+            follow.clear()
+            add("You", text)
+            ask_btn.setEnabled(False)
+            follow.setEnabled(False)
+
+            def work():
+                try:
+                    bridge.done.emit(chat.ask(text + "\n\n(Apply this to the prompt and output the full revised prompt only.)"), "")
+                except Exception as exc:
+                    bridge.done.emit("", str(exc))
+            threading.Thread(target=work, daemon=True).start()
+
+        ask_btn.clicked.connect(ask)
+        follow.returnPressed.connect(ask)
+
+        def use():
+            self.input.setPlainText(state["last"])
+            self.input.moveCursor(QTextCursor.End)
+            self.input.setFocus()
+            self.status("Prompt from Apple Intelligence placed in the message box - edit it, or press Send")
+            dlg.accept()
+
+        use_btn.clicked.connect(use)
+        cancel_btn.clicked.connect(dlg.reject)
+        dlg.finished.connect(lambda _r: (chat.close(), self.status("Ready")))
+        dlg.open()
+
     def send(self):
         if self.busy:
             return
         text = self.input.toPlainText().strip()
         if not text:
+            return
+        if text.startswith("?"):
+            self.refine_prompt(text[1:].strip() or None)
             return
         model = self.selected_model_id()
         if not model:
