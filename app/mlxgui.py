@@ -310,6 +310,7 @@ class ChatWindow(QMainWindow):
         self._assistant_raw = ""
 
         self._build_ui()
+        self._build_menu()
         _mem_note = _ml.memory_advisory()
         if _mem_note:
             self.append_meta(_mem_note)
@@ -321,6 +322,35 @@ class ChatWindow(QMainWindow):
         threading.Thread(target=self.start_server_and_models, daemon=True).start()
 
     # ---- UI ----
+
+    def _build_menu(self):
+        help_menu = self.menuBar().addMenu("Help")
+        act = help_menu.addAction("mlxcli Manual (all options and features)")
+        act.triggered.connect(self.open_manual)
+
+    def open_manual(self):
+        """Help > manual: shows the output of `mlxcli --man` (the same text the terminal prints)."""
+        if getattr(self, "_manual_dlg", None) is not None and self._manual_dlg.isVisible():
+            self._manual_dlg.raise_()
+            return
+        try:
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mlxcli")
+            r = subprocess.run([sys.executable, script, "--man"], capture_output=True, text=True, timeout=30)
+            text = r.stdout if r.returncode == 0 and r.stdout.strip() else f"Could not load the manual.\n{r.stderr[-500:]}"
+        except Exception as e:
+            text = f"Could not load the manual: {e}\nIn Terminal, run: mlxcli --man"
+        dlg = QDialog(self)
+        dlg.setWindowTitle("mlxcli Manual")
+        dlg.resize(900, 700)
+        lay = QVBoxLayout(dlg)
+        box = QPlainTextEdit()
+        box.setReadOnly(True)
+        box.setPlainText(text)
+        f = box.font(); f.setFamily("Menlo"); box.setFont(f)
+        lay.addWidget(box)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._manual_dlg = dlg
+        dlg.show()
 
     def _build_ui(self):
         central = QWidget(self)

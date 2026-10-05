@@ -73,6 +73,8 @@ Double-click the blue chat icon named **mlxgui-chat** on your Desktop. The first
 
 Terminal version: `mlxcli-chat` (if the command isn't found, add `~/.local/bin` to your PATH).
 
+**Manual.** `mlxcli-chat --man` in Terminal (or **Help → mlxcli Manual** in the app) lists every option, command, file format and environment variable.
+
 **Memory awareness.** At startup the app checks free memory and warns you when the Mac is tight, and it skips loading optional helper models when memory is low, so chat stays responsive. Close big apps if you see the advisory.
 
 **Prompt help (`?`).** Type `? your request` to have Apple Intelligence (macOS 26+, Apple Silicon) tighten the prompt before it is sent. Enter accepts it onto your input line, type to ask for changes, `/cancel` discards it. If Apple Intelligence is unavailable, `?` falls back to the local model.
