@@ -776,14 +776,13 @@ class ChatWindow(QMainWindow):
         bridge = AppleBridge(self)
         chat = _ml.AppleChat()
         ctx = _ml.apple_context(list(self.messages), {"model": self.selected_model_id() or "", "cwd": os.getcwd()})
-        first_prompt = _ml.apple_refine_first_prompt(raw, ctx)
 
         def work():
             try:
                 if not chat.available():
                     raise RuntimeError("Apple Intelligence isn't available on this Mac "
                                        "(it needs macOS 26 or later with Apple Intelligence turned on).")
-                bridge.done.emit(chat.ask(first_prompt, first=True), "")
+                bridge.done.emit(_ml.apple_refine_first(chat, raw, ctx), "")
             except Exception as exc:
                 bridge.done.emit("", str(exc))
 
