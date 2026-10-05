@@ -48,6 +48,11 @@ except ImportError:
     markdown_to_docx = None
 
 
+class _UpdateSignal(QObject):
+    """Carries the result of the background update check back to the GUI thread."""
+    result = Signal(str, str, str, bool)   # state ('update'|'current'|'offline'), installed, latest, user_asked
+
+
 class InputBox(QPlainTextEdit):
     """A QPlainTextEdit consumes Return itself (inserting a newline) before a QShortcut on the same
     widget ever sees it, so a shortcut-based "Return to send" binding silently never fires -- this
@@ -64,6 +69,7 @@ class InputBox(QPlainTextEdit):
         super().keyPressEvent(event)
 
 import mlxlib as _ml
+import updater as _upd
 from mlxlib import (
     load_default_dir, MAX_FILE_CHARS, MAX_TOOL_STEPS, MAX_HISTORY_TURNS, MAX_CONTEXT_CHARS,
     all_tool_schemas, plugin_tools, is_code_request,
@@ -327,6 +333,45 @@ class ChatWindow(QMainWindow):
         help_menu = self.menuBar().addMenu("Help")
         act = help_menu.addAction("mlxcli Manual (all options and features)")
         act.triggered.connect(self.open_manual)
+
+        self._update_signal = _UpdateSignal()
+        self._update_signal.result.connect(self._on_update_result)
+        self.update_action = help_menu.addAction("Check for Updates...")
+        self.update_action.triggered.connect(lambda: self.check_for_updates(True))
+        QTimer.singleShot(5000, lambda: self.check_for_updates(False))   # quiet check shortly after launch
+
+    def check_for_updates(self, user_asked):
+        """Ask GitHub for the newest version on a background thread (never blocks the window)."""
+        def work():
+            state, cur, new = _upd.check()
+            self._update_signal.result.emit(state, cur, new or "", user_asked)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_result(self, state, cur, new, user_asked):
+        if state == "update":
+            self.update_action.setText(f"Update Available (version {new})...")
+            self.statusBar().showMessage(f"Update available: version {new} (you have {cur}). Help > Update Available...", 15000)
+            self.update_action.triggered.disconnect()
+            self.update_action.triggered.connect(lambda: self.confirm_update(cur, new))
+            if user_asked:
+                self.confirm_update(cur, new)
+        elif user_asked and state == "current":
+            QMessageBox.information(self, "Check for Updates", f"You have the latest version ({cur}).")
+        elif user_asked:
+            QMessageBox.information(self, "Check for Updates",
+                                    "Could not reach GitHub to check for updates. Check your internet connection and try again.")
+
+    def confirm_update(self, cur, new):
+        answer = QMessageBox.question(
+            self, "Update mlxcli-chat",
+            f"Version {new} is available (you have {cur}).\n\n"
+            "Update now? This window will close, a Terminal window shows the progress (about a minute), "
+            "and mlxgui-chat reopens when it finishes. Your downloaded models and settings are kept.\n\n"
+            "Any unsaved conversation in this window will be lost.",
+            QMessageBox.Yes | QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            _upd.launch_update_in_terminal()
+            QTimer.singleShot(400, QApplication.instance().quit)
 
     def open_manual(self):
         """Help > manual: shows the output of `mlxcli --man` (the same text the terminal prints)."""

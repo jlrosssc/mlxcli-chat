@@ -66,6 +66,8 @@ Usage:
                              for summarization, where that heuristic false-positives on
                              ordinary words in the pasted text and wrongly grants tool
                              access the task never needed.
+  mlxcli --version           print the installed mlxcli-chat version and say whether an update is available.
+  mlxcli --self-update       install the newest published mlxcli-chat from GitHub (keeps models and settings).
   mlxcli --man               print the full manual (all options, commands, features, environment variables) and exit.
   mlxcli --run "task" --max-steps N
                              override the default MAX_TOOL_STEPS (mlxlib.py) for this
@@ -5563,6 +5565,22 @@ def parse_args(argv):
         elif argv[i] == "--man":
             print(man_text())
             sys.exit(0)
+        elif argv[i] == "--version":
+            import updater as _upd
+            state, cur, new = _upd.check()
+            print(f"mlxcli-chat {cur}" + (f" -- version {new} is available; run: mlxcli --self-update" if state == "update" else ""))
+            sys.exit(0)
+        elif argv[i] == "--self-update":
+            import updater as _upd
+            state, cur, new = _upd.check()
+            if state == "current":
+                print(f"mlxcli-chat {cur} is already the latest version.")
+                sys.exit(0)
+            if state == "offline":
+                print("Could not reach GitHub to check for updates.")
+                sys.exit(1)
+            print(f"Updating mlxcli-chat {cur} -> {new} ...")
+            sys.exit(_upd.run_update_inline())
         else:
             model = argv[i]
             i += 1

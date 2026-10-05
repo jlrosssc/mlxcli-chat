@@ -59,13 +59,21 @@ The chat window is built with [Qt](https://www.qt.io/qt-for-python) (via PySide6
 
 ## Update
 
-To get the latest fixes, run the installer again. It keeps oMLX and your downloaded models, and finishes in about a minute:
+**From inside the app (versions 1.1.0 and newer):** choose **Help > Check for Updates...** in mlxgui-chat. If a newer version is published on GitHub the menu reads **Update Available (version X)...** (it also checks quietly a few seconds after launch). Select it, click **Yes**, and a Terminal window shows the progress for about a minute, then the app reopens. Your models and settings are kept.
+
+In Terminal: `mlxcli --version` shows your version and whether a newer one exists, and `mlxcli --self-update` installs it.
+
+**From an older version (before 1.1.0):** it has no update menu yet, so run the installer once. It keeps oMLX and your downloaded models and finishes in about a minute (quit mlxgui-chat first if it is open):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jlrosssc/mlxcli-chat/main/install.sh | bash -s -- --models none
 ```
 
-(Prefer no Terminal? Download the ZIP again and double-click **Install mlxcli-chat.command**.) Quit mlxgui-chat first if it is open.
+(Prefer no Terminal? Download the ZIP again and double-click **Install mlxcli-chat.command**.)
+
+### Publishing an update (for the maintainer)
+
+Bump the number in `app/VERSION` (for example `1.1.0` to `1.2.0`), commit, and push to `main`. Every install with a lower version then sees **Update Available** on its next check. The installer itself always installs whatever is on `main`.
 
 ## Use it
 
