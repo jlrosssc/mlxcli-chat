@@ -126,6 +126,7 @@ try:
     from docx_export import markdown_to_docx as formatted_markdown_to_docx
 except ImportError:
     formatted_markdown_to_docx = None
+from mlxlib import host_mismatch_warning
 from mlxlib import (
     memory_advisory,
     compute_repo_update_status, compute_model_update_status,
@@ -1833,6 +1834,9 @@ def exec_tool(name, args, current_user_text=None):
                         f"confirmation. If this is intentional, rephrase the request "
                         f"using a word like 'discard', 'wipe', 'start fresh', 'force', "
                         f"or 'really do it' and it will be allowed through.")
+        _hm = host_mismatch_warning(current_user_text, alias_arg, host, cmd)
+        if _hm:
+            return _hm
         print(f"  tool: ssh_run ({host}: {display_cmd})")
         if not approve(f"ssh run {host}: {display_cmd}", category="ssh_run"):
             return "User declined."
@@ -1859,6 +1863,9 @@ def exec_tool(name, args, current_user_text=None):
                      "user@host.")
         source_label = alias_arg.strip() or host
         path = args.get("path", "")
+        _hm = host_mismatch_warning(current_user_text, alias_arg, host, "read " + path)
+        if _hm:
+            return _hm
         print(f"  tool: ssh_read ({host}:{path})")
         if not approve(f"ssh read {host}:{path}", category="ssh_read"):
             return "User declined."
@@ -4853,6 +4860,10 @@ def _chat_turn_body(url, key, model, messages, totals, agentic_mode, backend, ex
             if SANDBOX_HOST_MARKER in (result or ""):
                 what = args.get("command") if isinstance(args, dict) and fn == "run_command" else fn
                 sandbox_blocked.append(str(what)[:160])
+                result = (result + "\n[harness: this call did NOT run on the machine asked about, so it produced no real "
+                          "result. Do not state any time, uptime, status, or value as coming from it, and do not compute "
+                          "one from older log lines instead. To query a saved host call ssh_run with host set to that "
+                          "alias; if that is not possible, say plainly that you could not check.]")
             command_looks_like_write = fn == "run_command" and re.search(
                 r'(^|[;&|])\s*\S.*(>>?|\btee\b)\s+\S', args.get("command", "") if isinstance(args, dict) else "")
             if fn in ("ssh_write",) and not tool_result_failed(result):
