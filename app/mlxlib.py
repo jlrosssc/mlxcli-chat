@@ -2840,3 +2840,33 @@ def apple_refine_first(chat, raw_request, context=""):
         if apple_refinement_leaks(raw_request, reply, context):
             return raw_request
     return reply
+
+
+_HOST_MISMATCH_WARNED = set()
+
+def host_mismatch_warning(user_text, alias_arg, real_host, command=""):
+    """The user's message names one or more saved host aliases (say "web1") but the model ran the tool on a DIFFERENT
+    alias (say "db1"), so the answer would describe the wrong machine. Returns a warning string the FIRST time per (alias, command); an identical repeat goes through, so a deliberate cross-host call
+    (e.g. reading one host's logs that are stored on another) is not blocked, only made explicit."""
+    try:
+        aliases = {k: v for k, v in load_host_aliases().items() if v.get("type") == "ssh"}
+        text = (user_text or "").lower()
+        mentioned = {k for k in aliases if re.search(r"(?<![\w@.-])" + re.escape(k) + r"(?![\w@-])", text)}
+        if not mentioned:
+            return ""
+        arg = (alias_arg or "").strip().lower()
+        used = arg if arg in aliases else next(
+            (k for k, v in aliases.items() if f"{v.get('user')}@{v.get('host')}" == real_host), None)
+        if used is None or used in mentioned:
+            return ""
+        key = (used, command)
+        if key in _HOST_MISMATCH_WARNED:
+            return ""
+        _HOST_MISMATCH_WARNED.add(key)
+        names = " or ".join(f'"{m}"' for m in sorted(mentioned))
+        return (f"NOT RUN: the user's request names {names}, but this call targets \"{used}\", a different machine. "
+                f"Its output would describe {used}, not {names}. Call again with host set to {names} to answer the "
+                f"request. Only if you truly need {used} itself (for example, logs stored there), repeat this exact "
+                f"call and it will run -- and in the answer say which machine each fact came from.")
+    except Exception:
+        return ""
