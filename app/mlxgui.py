@@ -82,7 +82,7 @@ from mlxlib import (
     load_model_settings, save_model_settings, MODEL_SETTING_BOUNDS,
     caffeinate_guard, server_busy_guard, log_error,
     web_search, load_host_aliases, keychain_get, request as ha_http_request, api as ha_http_api,
-    prefer_default_model, drop_orphan_tool_messages,
+    prefer_default_model, remember_last_model, drop_orphan_tool_messages,
 )
 
 
@@ -970,6 +970,7 @@ class ChatWindow(QMainWindow):
         turn_start_index = len(working_messages)
         recent_step_blobs = []
         stuck_repeat_streak = 0
+        remember_last_model(model)
         for _step in range(MAX_TOOL_STEPS):
             payload = {
                 "model": model, "messages": apply_clarify_mode(working_messages, clarify_mode),

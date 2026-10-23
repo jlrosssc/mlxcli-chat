@@ -801,24 +801,50 @@ CLARIFY_USER_REMINDER = (
 )
 
 
-def apply_clarify_mode(messages, clarify_mode):
-    """Return a copy of an outgoing request with clarify instructions added, or the same
-    list when clarify_mode is off. The note goes LAST among the system messages (after
-    every other note) and a one-line reminder is appended to the latest user message.
+def merge_system_messages(messages):
+    """Return the request with every system message folded into ONE at the front.
+    Strict chat templates (Gemma 3, Mistral) accept a single system message only at the
+    start and answer HTTP 400 "Conversation roles must alternate" otherwise. The list is
+    returned unchanged when it already complies."""
+    systems = [m for m in messages if m.get("role") == "system"]
+    if not systems or (len(systems) == 1 and messages[0].get("role") == "system"):
+        return messages
+    text = "\n\n".join(m["content"] for m in systems if isinstance(m.get("content"), str) and m["content"])
+    return [{"role": "system", "content": text}] + [m for m in messages if m.get("role") != "system"]
+
+
+def apply_clarify_mode(messages, clarify_mode, anchor_index=None):
+    """Return a copy of an outgoing request with clarify instructions added (when
+    clarify_mode is on) and all system messages merged into one at the front (see
+    merge_system_messages). The note goes LAST among the system messages (after
+    every other note) and a one-line reminder is appended to a user message: the one at
+    anchor_index (in `messages`) when given, else the latest one. Callers in a tool loop
+    pass the turn's original user message as the anchor -- following the latest user
+    message moved the reminder whenever the loop injected a nudge, which edited an
+    earlier message and threw away the server's prompt cache for the whole prompt.
     clarify_mode: "auto" (switched on by the app) or any other truthy value (the user's
     own message asked for it, see has_clarify_intent)."""
     if not clarify_mode:
-        return messages
+        return merge_system_messages(messages)
     note = CLARIFY_AUTO_SYSTEM_NOTE if clarify_mode == "auto" else CLARIFY_MODE_SYSTEM_NOTE
     out = list(messages)
     last_system = max((i for i, m in enumerate(out) if m.get("role") == "system"), default=-1)
     out.insert(last_system + 1, {"role": "system", "content": note})
-    for i in range(len(out) - 1, -1, -1):
-        m = out[i]
+    reminded = False
+    if anchor_index is not None:
+        # Shifted by one if the note was inserted at or before it.
+        i = anchor_index + 1 if last_system + 1 <= anchor_index else anchor_index
+        m = out[i] if 0 <= i < len(out) else {}
         if m.get("role") == "user" and isinstance(m.get("content"), str):
             out[i] = dict(m, content=m["content"] + CLARIFY_USER_REMINDER)
-            break
-    return out
+            reminded = True
+    if not reminded:
+        for i in range(len(out) - 1, -1, -1):
+            m = out[i]
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                out[i] = dict(m, content=m["content"] + CLARIFY_USER_REMINDER)
+                break
+    return merge_system_messages(out)
 
 
 def has_clarify_intent(user_message):
@@ -2590,6 +2616,23 @@ def prefer_default_model(ids):
         if want in mid.lower():
             return [mid] + ids[:i] + ids[i + 1:]
     return ids
+
+
+def remember_last_model(model):
+    """Save the model a chat just used as the preferred default (see prefer_default_model), so the
+    next session starts on it. Best effort: a read-only home or odd id is ignored."""
+    mid = (model or "").strip()
+    if mid.endswith("-fast"):
+        mid = mid[:-5]
+    if not mid:
+        return
+    try:
+        if DEFAULT_MODEL_PREF_PATH.exists() and DEFAULT_MODEL_PREF_PATH.read_text().strip() == mid:
+            return
+        DEFAULT_MODEL_PREF_PATH.parent.mkdir(parents=True, exist_ok=True)
+        DEFAULT_MODEL_PREF_PATH.write_text(mid + "\n")
+    except OSError:
+        pass
 # In-turn context compaction (shared by mlxcli and mlxgui). Tool rounds more recent than
 # KEEP_RECENT_TOOL_ROUNDS are never touched; tool-call arguments shorter than
 # COMPACT_MIN_CHARS aren't worth replacing.
@@ -2809,6 +2852,13 @@ def apple_refine_first_prompt(raw_request, context=""):
 
 _LOCAL_SYSTEM_WORDS = re.compile(r"\b(launchd|launchctl|cron|crontab|log files?|shell history|process list|plist|grep|sudo|"
                                  r"/var/|/etc/|/Users/|~/|\.log)\b|/var/|/etc/|~/", re.I)
+
+
+def current_date_line():
+    """One line giving the model today's date (it has no clock). Added once per session so the prompt prefix stays stable."""
+    import datetime as _dt
+    d = _dt.date.today()
+    return f"Today's date is {d.strftime('%A, %B')} {d.day}, {d.year} ({d.isoformat()}). Your training data may be older than this."
 
 
 _LOCAL_CUE = re.compile(r"\b(my|mine|this mac|computer|laptop|files?|folders?|director(?:y|ies)|disk|storage|process(?:es)?|jobs?|"
